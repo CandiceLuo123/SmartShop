@@ -1,0 +1,24 @@
+{
+  "shop": {
+    "name": "小铺严选",
+    "agent_name": "小铺智答"
+  },
+  "today": "2026-10-25",
+  "api": {
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "key_env": ["ZHIPUAI_API_KEY", "GLM_API_KEY", "ZHIPU_API_KEY", "BIGMODEL_API_KEY"],
+    "models": ["glm-4.7", "glm-4.6", "glm-4-plus", "glm-4-flash"],
+    "timeout_seconds": 60,
+    "max_retries": 2
+  },
+  "agent": {
+    "max_rounds": 6,
+    "temperature": 0.3,
+    "max_tokens": 1024
+  },
+  "paths": {
+    "db": "data/shop.db",
+    "knowledge_dir": "data/knowledge",
+    "system_prompt": "prompts/system_prompt.md"
+  }
+}

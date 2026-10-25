@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · 小铺智答</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-logo">
+      <div class="mark">🛍️</div>
+      <div>
+        <h1>小铺智答</h1>
+        <div style="font-size:12px;color:var(--text-3)">AI 智能客服平台</div>
+      </div>
+    </div>
+    <p class="login-sub">7×24 小时在线，查订单、办售后、推荐好物</p>
+
+    <div class="login-tabs">
+      <button id="tabLogin" class="active" onclick="switchTab('login')">登 录</button>
+      <button id="tabReg" onclick="switchTab('reg')">注册账号</button>
+    </div>
+
+    <div class="login-error" id="err"></div>
+
+    <div class="login-field" id="fName" style="display:none">
+      <label>昵称</label>
+      <input class="input" id="displayName" placeholder="怎么称呼您？">
+    </div>
+    <div class="login-field">
+      <label>用户名</label>
+      <input class="input" id="username" autocomplete="username" placeholder="3-20 位字母 / 数字 / 下划线">
+    </div>
+    <div class="login-field">
+      <label>密码</label>
+      <input class="input" id="password" type="password" autocomplete="current-password" placeholder="至少 6 位">
+    </div>
+    <div class="login-field" id="fPhone" style="display:none">
+      <label>手机号（选填）</label>
+      <input class="input" id="phone" placeholder="用于售后联系">
+    </div>
+
+    <button class="btn btn-primary" id="btnGo" style="width:100%;margin-top:6px" onclick="go()">登 录</button>
+
+    <div class="login-demo">
+      演示账号（点击自动填入）：<br>
+      顾客：<span class="acc" onclick="fill('c001','demo1234')">c001 / demo1234</span> ·
+            <span class="acc" onclick="fill('c003','demo1234')">c003 / demo1234</span><br>
+      商家：<span class="acc" onclick="fill('admin','admin123')">admin / admin123</span>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+let mode = "login";
+function switchTab(m) {
+  mode = m;
+  document.getElementById("tabLogin").classList.toggle("active", m === "login");
+  document.getElementById("tabReg").classList.toggle("active", m === "reg");
+  document.getElementById("fName").style.display = m === "reg" ? "" : "none";
+  document.getElementById("fPhone").style.display = m === "reg" ? "" : "none";
+  document.getElementById("btnGo").textContent = m === "reg" ? "注 册" : "登 录";
+  hideErr();
+}
+function fill(u, p) {
+  document.getElementById("username").value = u;
+  document.getElementById("password").value = p;
+  hideErr();
+}
+function showErr(msg) {
+  const el = document.getElementById("err");
+  el.textContent = msg; el.style.display = "block";
+}
+function hideErr() { document.getElementById("err").style.display = "none"; }
+
+async function go() {
+  const username = document.getElementById("username").value.trim();
+  const password = document.getElementById("password").value;
+  if (!username || !password) return showErr("请输入用户名和密码");
+  const btn = document.getElementById("btnGo");
+  btn.disabled = true;
+  try {
+    const data = mode === "login"
+      ? await API.post("/api/login", { username, password })
+      : await API.post("/api/register", {
+          username, password,
+          display_name: document.getElementById("displayName").value.trim(),
+          phone: document.getElementById("phone").value.trim(),
+        });
+    API.setToken(data.token);
+    location.href = data.user.role === "admin" ? "/admin" : "/";
+  } catch (e) {
+    showErr(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+
+// 已登录直接进入
+if (API.token()) {
+  API.get("/api/me").then(u => {
+    location.href = u.role === "admin" ? "/admin" : "/";
+  }).catch(() => {});
+}
+</script>
+</body>
+</html>

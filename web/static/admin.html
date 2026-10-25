@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>商家后台 · 小铺智答</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <div class="mark">📊</div>
+      <div>
+        <div class="title">商家后台</div>
+        <div class="sub">小铺严选 · 运营看板</div>
+      </div>
+    </div>
+    <div class="sidebar-label">运营模块</div>
+    <div class="sidebar-list" id="navList">
+      <div class="session-item active" data-tab="overview"><span>📈</span><span class="s-title">经营概览</span></div>
+      <div class="session-item" data-tab="orders"><span>📦</span><span class="s-title">订单管理</span></div>
+      <div class="session-item" data-tab="tickets"><span>🎫</span><span class="s-title">售后工单</span></div>
+      <div class="session-item" data-tab="customers"><span>👥</span><span class="s-title">顾客档案</span></div>
+      <div class="session-item" data-tab="products"><span>🏷️</span><span class="s-title">商品库存</span></div>
+      <div class="session-item" data-tab="chats"><span>💬</span><span class="s-title">客服会话</span></div>
+    </div>
+    <div class="sidebar-foot">
+      <div class="avatar" style="background:linear-gradient(135deg,#4f46e5,#7c3aed)" id="uAvatar">商</div>
+      <div>
+        <div class="u-name" id="uName">…</div>
+        <div class="u-role">管理员</div>
+      </div>
+      <button class="icon-btn" title="退出登录" onclick="API.logout()">⎋</button>
+    </div>
+  </aside>
+
+  <main class="admin-main" id="mainArea"></main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+let me = null;
+const $main = document.getElementById("mainArea");
+
+(async function init() {
+  if (!API.token()) { location.href = "/login"; return; }
+  try { me = await API.get("/api/me"); } catch { return; }
+  if (me.role !== "admin") { location.href = "/"; return; }
+  document.getElementById("uName").textContent = me.display_name || "管理员";
+  document.getElementById("uAvatar").textContent = (me.display_name || "商")[0];
+  document.querySelectorAll("#navList .session-item").forEach(el => {
+    el.onclick = () => {
+      document.querySelectorAll("#navList .session-item").forEach(x => x.classList.remove("active"));
+      el.classList.add("active");
+      render(el.dataset.tab);
+    };
+  });
+  render("overview");
+})();
+
+/* ================= 概览 ================= */
+async function renderOverview() {
+  const d = await API.get("/api/admin/overview");
+  const s = d.stats;
+  const maxOrder = Math.max(1, ...d.order_status.map(x => x.n));
+  $main.innerHTML = `
+    <div class="admin-head-row">
+      <h2>经营概览</h2>
+      <div class="spacer"></div>
+      <span class="model-pill">模型：${escapeHtml(d.model || "-")}</span>
+    </div>
+    <div class="stat-grid">
+      ${statCard("👥", "#eef0fe", "注册顾客", s.customers)}
+      ${statCard("📦", "#e3f7ec", "订单总数", s.orders)}
+      ${statCard("🎫", "#fdf1e2", "未结工单", s.open_tickets)}
+      ${statCard("💬", "#e5edff", "客服会话", s.chat_sessions)}
+      ${statCard("⚡", "#f0ebfd", "今日咨询", s.today_chats)}
+      ${statCard("🏷️", "#fdeaea", "在售商品", s.products)}
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px">
+      <div class="panel">
+        <h3>📦 订单状态分布</h3>
+        ${d.order_status.map(o => `
+          <div class="bar-row">
+            <div class="b-label">${escapeHtml(o.status)}</div>
+            <div class="b-track"><div class="b-fill" style="width:${o.n / maxOrder * 100}%"></div></div>
+            <div class="b-val">${o.n}</div>
+          </div>`).join("") || "<p style='color:var(--text-3)'>暂无数据</p>"}
+      </div>
+      <div class="panel">
+        <h3>⚠️ 低库存预警（≤10）</h3>
+        ${d.low_stock.length ? `<table class="tbl"><tr><th>SKU</th><th>商品</th><th>库存</th></tr>
+          ${d.low_stock.map(p => `<tr><td class="mono">${p.sku}</td><td>${escapeHtml(p.name)}</td>
+            <td><span class="badge ${p.stock === 0 ? "badge-red" : "badge-orange"}">${p.stock}</span></td></tr>`).join("")}
+        </table>` : "<p style='color:var(--text-3)'>库存充足</p>"}
+      </div>
+    </div>
+    <div class="panel">
+      <h3>🎫 最新工单 <div class="spacer"></div>
+        <button class="btn btn-ghost btn-sm" onclick="render('tickets')">查看全部</button></h3>
+      ${d.recent_tickets.length ? `<table class="tbl">
+        <tr><th>工单号</th><th>类型</th><th>优先级</th><th>状态</th><th>顾客</th><th>描述</th><th>时间</th></tr>
+        ${d.recent_tickets.map(t => `<tr>
+          <td class="mono">${t.ticket_id}</td><td>${escapeHtml(t.type)}</td>
+          <td>${badge(t.priority)}</td><td>${badge(t.status)}</td>
+          <td>${escapeHtml(t.customer || t.customer_id || "-")}</td>
+          <td style="max-width:280px"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.description || "")}</div></td>
+          <td class="sub">${escapeHtml(t.created_at || "")}</td></tr>`).join("")}
+      </table>` : "<p style='color:var(--text-3)'>暂无工单</p>"}
+    </div>`;
+}
+
+function statCard(icon, bg, label, val) {
+  return `<div class="stat-card">
+    <div class="s-icon" style="background:${bg}">${icon}</div>
+    <div class="s-val">${val}</div><div class="s-label">${label}</div></div>`;
+}
+
+/* ================= 订单 ================= */
+async function renderOrders() {
+  const d = await API.get("/api/admin/orders");
+  $main.innerHTML = `
+    <div class="admin-head-row"><h2>订单管理</h2><div class="spacer"></div>
+      <span style="color:var(--text-3);font-size:13px">共 ${d.orders.length} 单</span></div>
+    <div class="panel">${d.orders.map(o => `
+      <div style="padding:12px 4px;border-bottom:1px solid #f0f2f7">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <b class="mono">${o.order_no}</b> ${badge(o.status)}
+          <span style="color:var(--text-2)">${escapeHtml(o.customer_name || o.customer_id)}</span>
+          <span style="color:var(--text-3);font-size:12.5px">${escapeHtml(o.created_at)}</span>
+          <div class="spacer" style="flex:1"></div>
+          <b>¥${o.total_amount}</b>
+        </div>
+        <div style="margin-top:6px;font-size:13px;color:var(--text-2)">
+          ${o.items.map(i => `${escapeHtml(i.name || i.sku)} ×${i.qty}`).join("　·　")}
+        </div>
+        <div style="margin-top:4px;font-size:12.5px;color:var(--text-3)">
+          ${o.carrier ? `🚚 ${escapeHtml(o.carrier)} ${escapeHtml(o.tracking_no)} · ${escapeHtml(o.logistics_status || "")}` : "（未发货）"}
+          ${o.logistics_status === "停滞" ? ' <span class="badge badge-red">物流异常</span>' : ""}
+          ${o.after_sale_note ? `<div style="margin-top:3px">📝 ${escapeHtml(o.after_sale_note)}</div>` : ""}
+        </div>
+      </div>`).join("")}
+    </div>`;
+}
+
+/* ================= 工单 ================= */
+async function renderTickets() {
+  const d = await API.get("/api/admin/tickets");
+  $main.innerHTML = `
+    <div class="admin-head-row"><h2>售后工单</h2><div class="spacer"></div>
+      <span style="color:var(--text-3);font-size:13px">共 ${d.tickets.length} 张</span></div>
+    <div class="panel"><table class="tbl">
+      <tr><th>工单号</th><th>类型</th><th>优先级</th><th>订单</th><th>描述</th><th>状态</th><th>操作</th></tr>
+      ${d.tickets.map(t => `<tr>
+        <td class="mono">${t.ticket_id}<div class="sub">${escapeHtml(t.created_at || "")}</div></td>
+        <td>${escapeHtml(t.type)}</td><td>${badge(t.priority)}</td>
+        <td class="mono">${escapeHtml(t.order_no || "-")}</td>
+        <td style="max-width:300px">${escapeHtml(t.description || "")}
+          ${t.resolved_note ? `<div class="sub">✅ ${escapeHtml(t.resolved_note)}</div>` : ""}</td>
+        <td>${badge(t.status)}</td>
+        <td><select class="select-status" onchange="updateTicket('${t.ticket_id}', this.value)">
+          ${["新建", "处理中", "已解决"].map(s =>
+            `<option ${s === t.status ? "selected" : ""}>${s}</option>`).join("")}
+        </select></td></tr>`).join("")}
+    </table></div>`;
+}
+
+async function updateTicket(tid, status) {
+  await API.patch("/api/admin/tickets/" + tid, { status, resolved_note: status === "已解决" ? "人工处理完毕" : null });
+  toast(`工单 ${tid} → ${status}`);
+  render("tickets");
+}
+
+/* ================= 顾客 ================= */
+async function renderCustomers() {
+  const d = await API.get("/api/admin/customers");
+  const vip = ["普通", "银卡", "金卡"];
+  $main.innerHTML = `
+    <div class="admin-head-row"><h2>顾客档案</h2><div class="spacer"></div>
+      <span style="color:var(--text-3);font-size:13px">共 ${d.customers.length} 人</span></div>
+    <div class="panel"><table class="tbl">
+      <tr><th>ID</th><th>姓名</th><th>会员</th><th>积分</th><th>订单数</th><th>手机号</th><th>平台账号</th><th>注册时间</th></tr>
+      ${d.customers.map(c => `<tr>
+        <td class="mono">${c.customer_id}</td><td>${escapeHtml(c.name)}</td>
+        <td>${badge(vip[c.vip_level] === "金卡" ? "高" : vip[c.vip_level] === "银卡" ? "中" : "低").replace(vip[c.vip_level] === "金卡" ? "高" : vip[c.vip_level] === "银卡" ? "中" : "低", vip[c.vip_level])}</td>
+        <td>${c.points}</td><td>${c.order_count}</td>
+        <td class="mono">${escapeHtml(c.phone || "-")}</td>
+        <td>${c.username ? `<span class="badge badge-blue">${escapeHtml(c.username)}</span>` : '<span class="badge badge-gray">未注册</span>'}</td>
+        <td class="sub">${escapeHtml((c.created_at || "").slice(0, 10))}</td></tr>`).join("")}
+    </table></div>`;
+}
+
+/* ================= 商品 ================= */
+async function renderProducts() {
+  const d = await API.get("/api/admin/products");
+  const groups = {};
+  d.products.forEach(p => (groups[p.category] = groups[p.category] || []).push(p));
+  $main.innerHTML = `
+    <div class="admin-head-row"><h2>商品库存</h2><div class="spacer"></div>
+      <span style="color:var(--text-3);font-size:13px">共 ${d.products.length} 个 SKU</span></div>
+    ${Object.entries(groups).map(([cat, list]) => `
+      <div class="panel"><h3>${escapeHtml(cat)}</h3><table class="tbl">
+        <tr><th>SKU</th><th>商品</th><th>价格</th><th>库存</th><th>评分</th><th>状态</th><th>标签</th></tr>
+        ${list.map(p => `<tr>
+          <td class="mono">${p.sku}</td>
+          <td>${escapeHtml(p.name)}<div class="sub" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(p.description || "")}</div></td>
+          <td><b>¥${p.price}</b></td>
+          <td><span class="badge ${p.stock === 0 ? "badge-red" : p.stock <= 10 ? "badge-orange" : "badge-green"}">${p.stock}</span></td>
+          <td>⭐ ${p.rating}</td><td>${badge(p.status)}</td>
+          <td style="max-width:220px"><span class="sub">${escapeHtml(p.tags || "")}</span></td></tr>`).join("")}
+      </table></div>`).join("")}`;
+}
+
+/* ================= 会话审查 ================= */
+async function renderChats() {
+  const d = await API.get("/api/admin/chats");
+  $main.innerHTML = `
+    <div class="admin-head-row"><h2>客服会话审查</h2><div class="spacer"></div>
+      <span style="color:var(--text-3);font-size:13px">点击会话查看完整对话与 Agent 工具轨迹</span></div>
+    <div class="panel">${d.chats.length ? `<table class="tbl">
+      <tr><th>会话</th><th>用户</th><th>消息数</th><th>更新时间</th><th></th></tr>
+      ${d.chats.map(c => `<tr>
+        <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><b>${escapeHtml(c.title)}</b></td>
+        <td>${escapeHtml(c.display_name || c.username || "-")}${c.role === "admin" ? ' <span class="badge badge-purple">管理员</span>' : ""}</td>
+        <td>${c.msg_count}</td><td class="sub">${escapeHtml(c.updated_at || "")}</td>
+        <td><button class="btn btn-ghost btn-sm" onclick="viewChat('${c.id}')">查看</button></td></tr>`).join("")}
+    </table>` : "<p style='color:var(--text-3)'>暂无会话记录，去顾客端聊两句就有了～</p>"}</div>
+    <div id="chatDetail"></div>`;
+}
+
+async function viewChat(sid) {
+  const d = await API.get("/api/admin/chats/" + sid);
+  const box = document.getElementById("chatDetail");
+  box.innerHTML = `
+    <div class="panel">
+      <h3>💬 ${escapeHtml(d.session.title)}
+        <span class="badge badge-blue">${escapeHtml(d.session.username || "-")}</span>
+        <div class="spacer"></div>
+        <button class="btn btn-ghost btn-sm" onclick="this.closest('.panel').remove()">收起</button></h3>
+      ${d.messages.length ? d.messages.map(m => `
+        <div class="chat-view-item">
+          <div class="role-tag ${m.role === "user" ? "user" : "bot"}">${m.role === "user" ? "顾客" : "客服AI"}</div>
+          <div class="cv-content">${m.role === "user" ? escapeHtml(m.content) : renderMarkdown(m.content)}
+            ${m.role === "assistant" && (m.tools || []).length ? `<div class="cv-tools">
+              ${(m.tools || []).map(t => `<span class="tool-chip done">🔧 ${escapeHtml(TOOL_LABELS[t] || t)}</span>`).join("")}
+            </div>` : ""}
+            ${m.role === "assistant" && (m.trace || []).length ? `<div class="sub" style="color:var(--text-3);font-size:12px;margin-top:6px">
+              轨迹：${m.trace.map(t => `${TOOL_LABELS[t.tool] || t.tool}(${t.elapsed_ms}ms)`).join(" → ")}</div>` : ""}
+          </div>
+        </div>`).join("") : "<p style='color:var(--text-3)'>该会话暂无消息</p>"}
+    </div>`;
+  box.scrollIntoView({ behavior: "smooth" });
+}
+
+const RENDERERS = { overview: renderOverview, orders: renderOrders, tickets: renderTickets,
+                    customers: renderCustomers, products: renderProducts, chats: renderChats };
+async function render(tab) { try { await RENDERERS[tab](); } catch (e) { toast(e.message); } }
+</script>
+</body>
+</html>

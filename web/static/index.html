@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>小铺智答 · AI 客服</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<div class="layout">
+  <!-- 侧边栏 -->
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <div class="mark">🛍️</div>
+      <div>
+        <div class="title">小铺智答</div>
+        <div class="sub">AI 智能客服</div>
+      </div>
+    </div>
+    <button class="sidebar-new" onclick="newSession()">＋ 新建对话</button>
+    <div class="sidebar-label">历史对话</div>
+    <div class="sidebar-list" id="sessionList"></div>
+    <div class="sidebar-foot">
+      <div class="avatar" id="uAvatar">客</div>
+      <div>
+        <div class="u-name" id="uName">…</div>
+        <div class="u-role" id="uRole"></div>
+      </div>
+      <button class="icon-btn" title="退出登录" onclick="API.logout()">⎋</button>
+    </div>
+  </aside>
+
+  <!-- 主区 -->
+  <main class="main">
+    <div class="chat-head">
+      <div class="c-title" id="chatTitle">新对话</div>
+      <span class="model-pill" id="modelPill">GLM Agent</span>
+      <div class="spacer"></div>
+    </div>
+
+    <div class="chat-scroll" id="chatScroll">
+      <div class="empty-state" id="emptyState">
+        <div class="big">💬</div>
+        <h3>您好，我是小铺智答</h3>
+        <p>查订单 · 办退换 · 问政策 · 推荐好物，尽管开口</p>
+        <div class="hint-items">
+          <span class="hint-chip" onclick="quickAsk('我的订单SO2610180003物流怎么不动了？')">📦 查物流停滞订单</span>
+          <span class="hint-chip" onclick="quickAsk('充电宝鼓包了怎么处理？')">🔋 充电宝鼓包售后</span>
+          <span class="hint-chip" onclick="quickAsk('有适合跑步的耳机吗？预算200以内')">🏃 推荐跑步耳机</span>
+          <span class="hint-chip" onclick="quickAsk('超过7天还能补差价吗？')">💰 价保政策咨询</span>
+        </div>
+      </div>
+      <div class="chat-inner" id="chatInner" style="display:none"></div>
+    </div>
+
+    <div class="chat-input-wrap">
+      <div class="chat-input-box">
+        <textarea id="inputBox" rows="1" placeholder="输入您的问题，Enter 发送 / Shift+Enter 换行"></textarea>
+        <button class="send-btn" id="btnSend" onclick="send()">➤</button>
+      </div>
+      <div class="input-hint">内容由 AI 生成，售后处理以人工审核为准</div>
+    </div>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+let me = null;
+let currentSession = null;
+let sessions = [];
+let sending = false;
+
+const $scroll = document.getElementById("chatScroll");
+const $inner = document.getElementById("chatInner");
+const $input = document.getElementById("inputBox");
+
+/* ---------------- 初始化 ---------------- */
+(async function init() {
+  if (!API.token()) { location.href = "/login"; return; }
+  try {
+    me = await API.get("/api/me");
+  } catch { return; }
+  if (me.role === "admin") { location.href = "/admin"; return; }
+  document.getElementById("uName").textContent = me.display_name || me.username;
+  document.getElementById("uRole").textContent = me.customer_profile || me.username;
+  document.getElementById("uAvatar").textContent = (me.display_name || "客")[0];
+  await loadSessions();
+  if (sessions.length) openSession(sessions[0].id);
+})();
+
+async function loadSessions() {
+  const data = await API.get("/api/sessions");
+  sessions = data.sessions;
+  const list = document.getElementById("sessionList");
+  list.innerHTML = "";
+  for (const s of sessions) {
+    const div = document.createElement("div");
+    div.className = "session-item" + (s.id === currentSession ? " active" : "");
+    div.innerHTML = `<span style="opacity:.7">💬</span>
+      <span class="s-title">${escapeHtml(s.title)}</span>
+      <button class="s-del" title="删除">✕</button>`;
+    div.onclick = () => openSession(s.id);
+    div.querySelector(".s-del").onclick = e => { e.stopPropagation(); removeSession(s.id); };
+    list.appendChild(div);
+  }
+}
+
+async function newSession() {
+  const data = await API.post("/api/sessions");
+  currentSession = data.session_id;
+  document.getElementById("chatTitle").textContent = "新对话";
+  $inner.innerHTML = "";
+  $inner.style.display = "none";
+  document.getElementById("emptyState").style.display = "flex";
+  await loadSessions();
+}
+
+async function removeSession(sid) {
+  if (!confirm("删除该对话？")) return;
+  await API.del("/api/sessions/" + sid);
+  if (sid === currentSession) {
+    currentSession = null;
+    $inner.innerHTML = "";
+    document.getElementById("emptyState").style.display = "flex";
+  }
+  await loadSessions();
+}
+
+async function openSession(sid) {
+  currentSession = sid;
+  await loadSessions();
+  const data = await API.get("/api/sessions/" + sid);
+  document.getElementById("chatTitle").textContent = data.session.title;
+  $inner.innerHTML = "";
+  document.getElementById("emptyState").style.display = data.messages.length ? "none" : "flex";
+  $inner.style.display = data.messages.length ? "" : "none";
+  for (const m of data.messages) {
+    if (m.role === "user") addMessage("user", m.content, []);
+    else addMessage("assistant", m.content, m.tools || []);
+  }
+  scrollBottom();
+}
+
+function quickAsk(text) {
+  $input.value = text;
+  send();
+}
+
+/* ---------------- 消息渲染 ---------------- */
+function addMessage(role, content, tools) {
+  document.getElementById("emptyState").style.display = "none";
+  $inner.style.display = "";
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  const chips = (tools || []).map(t => {
+    const label = typeof t === "string" ? (TOOL_LABELS[t] || t) : t;
+    return `<span class="tool-chip done">🔧 ${escapeHtml(label)}</span>`;
+  }).join("");
+  div.innerHTML = `
+    <div class="m-avatar">${role === "user" ? "🙋" : "🤖"}</div>
+    <div class="m-body">
+      <div class="m-name">${role === "user" ? escapeHtml(me.display_name || "我") : "小铺智答"}</div>
+      <div class="tool-chips">${chips}</div>
+      <div class="bubble">${role === "user" ? escapeHtml(content) : renderMarkdown(content)}</div>
+    </div>`;
+  $inner.appendChild(div);
+  scrollBottom();
+  return div;
+}
+
+function scrollBottom() {
+  $scroll.scrollTop = $scroll.scrollHeight;
+}
+
+/* ---------------- 发送 & SSE ---------------- */
+async function send() {
+  if (sending) return;
+  const text = $input.value.trim();
+  if (!text) return;
+  if (!currentSession) {
+    const data = await API.post("/api/sessions");
+    currentSession = data.session_id;
+    await loadSessions();
+  }
+  sending = true;
+  $input.value = "";
+  autoGrow();
+  document.getElementById("btnSend").disabled = true;
+  addMessage("user", text, []);
+
+  // 占位：状态行 + 工具 chips 容器 + typing 气泡
+  const holder = document.createElement("div");
+  holder.className = "msg assistant";
+  holder.innerHTML = `
+    <div class="m-avatar">🤖</div>
+    <div class="m-body">
+      <div class="m-name">小铺智答</div>
+      <div class="status-line" id="statusLine">正在思考…</div>
+      <div class="tool-chips" id="liveChips"></div>
+      <div class="bubble"><span class="typing"><i></i><i></i><i></i></span></div>
+    </div>`;
+  $inner.appendChild(holder);
+  scrollBottom();
+
+  const statusLine = holder.querySelector("#statusLine");
+  const chipsBox = holder.querySelector("#liveChips");
+  const bubble = holder.querySelector(".bubble");
+  const toolLabels = [];
+
+  try {
+    const resp = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + API.token() },
+      body: JSON.stringify({ session_id: currentSession, message: text }),
+    });
+    if (resp.status === 401) { API.logout(); return; }
+    if (!resp.ok || !resp.body) throw new Error("连接服务失败");
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop();
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        let ev;
+        try { ev = JSON.parse(payload); } catch { continue; }
+
+        if (ev.type === "llm_thinking") {
+          statusLine.textContent = ev.round > 1 ? `第 ${ev.round} 轮分析中…` : "正在思考…";
+        } else if (ev.type === "tool_start") {
+          const label = TOOL_LABELS[ev.tool] || ev.tool;
+          toolLabels.push(label);
+          const chip = document.createElement("span");
+          chip.className = "tool-chip running";
+          chip.innerHTML = `<span class="spin"></span> ${escapeHtml(label)}`;
+          chipsBox.appendChild(chip);
+          statusLine.textContent = "调用工具：" + label;
+          scrollBottom();
+        } else if (ev.type === "tool_end") {
+          const last = chipsBox.lastElementChild;
+          if (last) {
+            last.className = "tool-chip done";
+            last.innerHTML = `🔧 ${escapeHtml(last.textContent.replace("🔧", "").trim())}`;
+            last.title = (ev.summary || "").slice(0, 160);
+          }
+        } else if (ev.type === "generating") {
+          statusLine.textContent = "正在组织回复…";
+        } else if (ev.type === "error") {
+          throw new Error(ev.message || "服务异常");
+        } else if (ev.type === "answer") {
+          statusLine.remove();
+          bubble.innerHTML = renderMarkdown(ev.answer);
+          scrollBottom();
+        }
+      }
+    }
+    // 刷新侧边栏标题（新对话首条消息后会更新）
+    if (!sessions.find(s => s.id === currentSession)) await loadSessions();
+    else await loadSessions();
+  } catch (e) {
+    statusLine.remove();
+    bubble.classList.add("error");
+    bubble.textContent = "回复失败：" + e.message + "（请重试，或回复\"转人工\"）";
+  } finally {
+    sending = false;
+    document.getElementById("btnSend").disabled = false;
+    $input.focus();
+  }
+}
+
+function autoGrow() {
+  $input.style.height = "auto";
+  $input.style.height = Math.min($input.scrollHeight, 130) + "px";
+}
+$input.addEventListener("input", autoGrow);
+$input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+</script>
+</body>
+</html>
