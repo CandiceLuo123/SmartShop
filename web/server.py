@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from src.agent import AgentSession, load_config
 from src.llm import build_llm
+from src import memory
 from src.tools import get_customer_profile
 from web import auth
 from web.db import connect, ensure_schema, next_customer_id, now_str, rows
@@ -209,23 +210,27 @@ def get_session(sid: str, request: Request):
 
 
 def _get_agent(sid: str, user: dict) -> AgentSession:
-    """取内存中的会话 Agent；没有则从数据库快照恢复完整上下文。"""
+    """取内存中的会话 Agent；没有则从数据库快照恢复完整上下文与记忆。"""
     with _AGENTS_LOCK:
         agent = _AGENTS.get(sid)
         if agent is not None:
             return agent
         with closing(connect()) as conn:
-            snap = rows(conn, "SELECT messages_json FROM chat_sessions "
+            snap = rows(conn, "SELECT messages_json, summary FROM chat_sessions "
                               "WHERE id=? AND user_id=?", (sid, user["id"]))
-        messages = []
+        messages, summary = [], ""
         if snap:
             try:
                 messages = json.loads(snap[0]["messages_json"] or "[]")
             except json.JSONDecodeError:
                 messages = []
-        agent = AgentSession(_CFG, _LLM, customer_id=user["customer_id"])
+            summary = snap[0]["summary"] or ""
+        profile = memory.get_profile(user["id"]) if user["id"] else {}
+        agent = AgentSession(_CFG, _LLM, customer_id=user["customer_id"],
+                             profile=profile)
         if messages:
             agent.messages = messages
+        agent.session_summary = summary
         _AGENTS[sid] = agent
         return agent
 
@@ -245,6 +250,7 @@ async def chat_stream(request: Request):
         return JSONResponse({"detail": "会话不存在"}, status_code=404)
 
     agent = _get_agent(sid, user)
+    turn_counter = {"n": 0}
 
     def event_gen():
         result = None
@@ -253,34 +259,47 @@ async def chat_stream(request: Request):
                 if event["type"] == "result":
                     result = event["result"]
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event["type"] == "compress":
+                    turn_counter["n"] = 0  # 压缩后重新计数，立即刷新一次画像
         except Exception as e:  # noqa: BLE001 —— 出错也要让前端收到失败事件
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
-        # 持久化（失败也落盘）
+        # 持久化（失败也落盘）：消息、上下文快照、会话摘要、画像增量更新
         try:
             answer = (result or {}).get("answer") or "（本次回复失败，请重试或转人工）"
             tools = json.dumps((result or {}).get("tool_calls") or [],
                                ensure_ascii=False)
             trace = json.dumps((result or {}).get("trace") or [],
                                ensure_ascii=False)
+            route = json.dumps((result or {}).get("route") or {},
+                               ensure_ascii=False)
             with closing(connect()) as conn:
                 conn.execute(
                     "INSERT INTO chat_messages (session_id, role, content, "
-                    "tools, trace_json, created_at) VALUES (?,?,?,?,?,?)",
-                    (sid, "user", message, "[]", "[]", now_str()))
+                    "tools, trace_json, route_json, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (sid, "user", message, "[]", "[]", "[]", now_str()))
                 conn.execute(
                     "INSERT INTO chat_messages (session_id, role, content, "
-                    "tools, trace_json, created_at) VALUES (?,?,?,?,?,?)",
-                    (sid, "assistant", answer, tools, trace, now_str()))
+                    "tools, trace_json, route_json, created_at) VALUES (?,?,?,?,?,?,?)",
+                    (sid, "assistant", answer, tools, trace, route, now_str()))
                 title = message[:18] + ("…" if len(message) > 18 else "")
                 conn.execute(
-                    "UPDATE chat_sessions SET messages_json=?, updated_at=? "
-                    "WHERE id=?",
+                    "UPDATE chat_sessions SET messages_json=?, summary=?, "
+                    "updated_at=? WHERE id=?",
                     (json.dumps(agent.messages, ensure_ascii=False),
-                     now_str(), sid))
+                     agent.session_summary, now_str(), sid))
                 conn.execute(
                     "UPDATE chat_sessions SET title=? WHERE id=? AND title='新对话'",
                     (title, sid))
                 conn.commit()
+            # L3 画像：每 N 轮增量更新一次（写库失败不影响对话）
+            turn_counter["n"] += 1
+            if user["id"] and turn_counter["n"] >= memory.PROFILE_UPDATE_EVERY:
+                turn_counter["n"] = 0
+                try:
+                    agent.profile = memory.update_profile(
+                        _LLM, user["id"], user["customer_id"], message, answer)
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001
             pass
         yield "data: [DONE]\n\n"
@@ -288,6 +307,19 @@ async def chat_stream(request: Request):
     return StreamingResponse(event_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------- 记忆（画像/摘要）查询
+@app.get("/api/memory")
+def get_memory(request: Request):
+    user = require_user(request)
+    profile = memory.get_profile(user["id"])
+    with closing(connect()) as conn:
+        summaries = rows(
+            conn, "SELECT id, title, summary, updated_at FROM chat_sessions "
+                  "WHERE user_id=? AND summary!='' ORDER BY updated_at DESC LIMIT 10",
+            (user["id"],))
+    return {"profile": profile, "summaries": summaries}
 
 
 # ---------------------------------------------------------------- 商家端
@@ -417,10 +449,11 @@ def admin_chat_detail(sid: str, request: Request):
                           "LEFT JOIN users u ON s.user_id=u.id WHERE s.id=?", (sid,))
         if not meta:
             return JSONResponse({"detail": "会话不存在"}, status_code=404)
-        msgs = rows(conn, "SELECT role, content, tools, trace_json, created_at "
-                          "FROM chat_messages WHERE session_id=? ORDER BY id", (sid,))
+        msgs = rows(conn, "SELECT role, content, tools, trace_json, route_json, "
+                          "created_at FROM chat_messages WHERE session_id=? "
+                          "ORDER BY id", (sid,))
     for m in msgs:
-        for field in ("tools", "trace_json"):
+        for field in ("tools", "trace_json", "route_json"):
             try:
                 m[field] = json.loads(m[field] or "[]")
             except json.JSONDecodeError:

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Web 服务启动入口：python run_web.py [--port 8000]"""
+"""Web 服务启动入口：python run_web.py [--port 8001]"""
 import argparse
 
 import uvicorn
@@ -9,7 +9,7 @@ from web.db import ensure_schema
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=8001)
     args = parser.parse_args()
 
     ensure_schema()

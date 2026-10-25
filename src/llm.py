@@ -102,7 +102,8 @@ class ZhipuLLM:
         raise last_err
 
     # ---------- 对外接口 ----------
-    def complete(self, messages: list, tools: list | None = None) -> dict:
+    def complete(self, messages: list, tools: list | None = None,
+                 max_tokens: int | None = None) -> dict:
         order = ([self.model_in_use] if self.model_in_use else []) + [
             m for m in self.models if m != self.model_in_use
         ]
@@ -112,7 +113,7 @@ class ZhipuLLM:
                 "model": model,
                 "messages": messages,
                 "temperature": self.temperature,
-                "max_tokens": self.max_tokens,
+                "max_tokens": max_tokens or self.max_tokens,
             }
             if tools:
                 payload["tools"] = tools

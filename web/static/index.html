@@ -14,19 +14,25 @@
       <div class="mark">🛍️</div>
       <div>
         <div class="title">小铺智答</div>
-        <div class="sub">AI 智能客服</div>
+        <div class="sub">多专家 AI 客服</div>
       </div>
     </div>
-    <button class="sidebar-new" onclick="newSession()">＋ 新建对话</button>
-    <div class="sidebar-label">历史对话</div>
+    <button class="sidebar-new" onclick="newSession()"><span class="plus">＋</span> 新建对话</button>
+    <div class="sidebar-label">最近对话</div>
     <div class="sidebar-list" id="sessionList"></div>
     <div class="sidebar-foot">
-      <div class="avatar" id="uAvatar">客</div>
-      <div>
-        <div class="u-name" id="uName">…</div>
-        <div class="u-role" id="uRole"></div>
+      <button class="mem-btn" onclick="openMemory()">
+        <span class="m-ic">🧠</span>
+        <span class="m-txt">AI 记忆<span class="m-sub" id="memHint">画像与会话摘要</span></span>
+      </button>
+      <div class="user-row">
+        <div class="avatar" id="uAvatar">客</div>
+        <div>
+          <div class="u-name" id="uName">…</div>
+          <div class="u-role" id="uRole"></div>
+        </div>
+        <button class="icon-btn" title="退出登录" onclick="API.logout()">⎋</button>
       </div>
-      <button class="icon-btn" title="退出登录" onclick="API.logout()">⎋</button>
     </div>
   </aside>
 
@@ -34,20 +40,19 @@
   <main class="main">
     <div class="chat-head">
       <div class="c-title" id="chatTitle">新对话</div>
-      <span class="model-pill" id="modelPill">GLM Agent</span>
+      <span id="specBadge"></span>
       <div class="spacer"></div>
     </div>
 
     <div class="chat-scroll" id="chatScroll">
       <div class="empty-state" id="emptyState">
-        <div class="big">💬</div>
-        <h3>您好，我是小铺智答</h3>
-        <p>查订单 · 办退换 · 问政策 · 推荐好物，尽管开口</p>
-        <div class="hint-items">
-          <span class="hint-chip" onclick="quickAsk('我的订单SO2610180003物流怎么不动了？')">📦 查物流停滞订单</span>
-          <span class="hint-chip" onclick="quickAsk('充电宝鼓包了怎么处理？')">🔋 充电宝鼓包售后</span>
-          <span class="hint-chip" onclick="quickAsk('有适合跑步的耳机吗？预算200以内')">🏃 推荐跑步耳机</span>
-          <span class="hint-chip" onclick="quickAsk('超过7天还能补差价吗？')">💰 价保政策咨询</span>
+        <div class="hello">您好，我是 <span class="grad">小铺智答</span></div>
+        <p>多专家智能团队为您服务：投诉处理 · 售后 · 账单 · 物流 · 导购 · 政策</p>
+        <div class="hint-grid">
+          <span class="hint-card" onclick="quickAsk('我的订单SO2610180003快递5天没动了，再不处理我就投诉！')"><span class="h-ic">🧡</span>投诉物流停滞（路由到投诉专员）</span>
+          <span class="hint-card" onclick="quickAsk('充电宝好像鼓包了，有点害怕，怎么处理？')"><span class="h-ic">🛠️</span>充电宝鼓包售后（路由到售后专员）</span>
+          <span class="hint-card" onclick="quickAsk('我订单的退款怎么还没到账？')"><span class="h-ic">💰</span>退款到账进度（路由到账单专员）</span>
+          <span class="hint-card" onclick="quickAsk('预算200以内，推荐个适合跑步的耳机')"><span class="h-ic">🛍️</span>跑步耳机推荐（路由到导购顾问）</span>
         </div>
       </div>
       <div class="chat-inner" id="chatInner" style="display:none"></div>
@@ -55,12 +60,20 @@
 
     <div class="chat-input-wrap">
       <div class="chat-input-box">
-        <textarea id="inputBox" rows="1" placeholder="输入您的问题，Enter 发送 / Shift+Enter 换行"></textarea>
+        <textarea id="inputBox" rows="1" placeholder="输入您的问题，AI 会自动识别意图并分派专家…"></textarea>
         <button class="send-btn" id="btnSend" onclick="send()">➤</button>
       </div>
       <div class="input-hint">内容由 AI 生成，售后处理以人工审核为准</div>
     </div>
   </main>
+</div>
+
+<!-- AI 记忆抽屉 -->
+<div class="drawer-mask" id="drawerMask" onclick="closeMemory()"></div>
+<div class="drawer" id="drawer">
+  <div class="drawer-head">🧠 AI 记忆<div class="spacer"></div>
+    <button class="btn btn-ghost btn-sm" onclick="closeMemory()">关闭</button></div>
+  <div class="drawer-body" id="drawerBody"></div>
 </div>
 
 <script src="/static/js/common.js"></script>
@@ -77,15 +90,14 @@ const $input = document.getElementById("inputBox");
 /* ---------------- 初始化 ---------------- */
 (async function init() {
   if (!API.token()) { location.href = "/login"; return; }
-  try {
-    me = await API.get("/api/me");
-  } catch { return; }
+  try { me = await API.get("/api/me"); } catch { return; }
   if (me.role === "admin") { location.href = "/admin"; return; }
   document.getElementById("uName").textContent = me.display_name || me.username;
   document.getElementById("uRole").textContent = me.customer_profile || me.username;
   document.getElementById("uAvatar").textContent = (me.display_name || "客")[0];
   await loadSessions();
   if (sessions.length) openSession(sessions[0].id);
+  refreshMemHint();
 })();
 
 async function loadSessions() {
@@ -96,7 +108,7 @@ async function loadSessions() {
   for (const s of sessions) {
     const div = document.createElement("div");
     div.className = "session-item" + (s.id === currentSession ? " active" : "");
-    div.innerHTML = `<span style="opacity:.7">💬</span>
+    div.innerHTML = `<span style="opacity:.55;font-size:13px">💬</span>
       <span class="s-title">${escapeHtml(s.title)}</span>
       <button class="s-del" title="删除">✕</button>`;
     div.onclick = () => openSession(s.id);
@@ -109,10 +121,12 @@ async function newSession() {
   const data = await API.post("/api/sessions");
   currentSession = data.session_id;
   document.getElementById("chatTitle").textContent = "新对话";
+  document.getElementById("specBadge").innerHTML = "";
   $inner.innerHTML = "";
   $inner.style.display = "none";
   document.getElementById("emptyState").style.display = "flex";
   await loadSessions();
+  $input.focus();
 }
 
 async function removeSession(sid) {
@@ -121,6 +135,7 @@ async function removeSession(sid) {
   if (sid === currentSession) {
     currentSession = null;
     $inner.innerHTML = "";
+    document.getElementById("specBadge").innerHTML = "";
     document.getElementById("emptyState").style.display = "flex";
   }
   await loadSessions();
@@ -134,20 +149,33 @@ async function openSession(sid) {
   $inner.innerHTML = "";
   document.getElementById("emptyState").style.display = data.messages.length ? "none" : "flex";
   $inner.style.display = data.messages.length ? "" : "none";
+  let lastRoute = null;
   for (const m of data.messages) {
     if (m.role === "user") addMessage("user", m.content, []);
-    else addMessage("assistant", m.content, m.tools || []);
+    else { addMessage("assistant", m.content, m.tools || [], m.route || null); lastRoute = m.route; }
   }
+  if (lastRoute && lastRoute.specialist) showSpecBadge(lastRoute);
   scrollBottom();
 }
 
-function quickAsk(text) {
-  $input.value = text;
-  send();
+function quickAsk(text) { $input.value = text; send(); }
+
+function specChip(route) {
+  const color = (SPECIALIST_COLORS[route.specialist] || "#1a73e8");
+  return `<span class="spec-chip" style="background:${color}18;color:${color}">
+    ${route.emoji || "🤖"} ${escapeHtml(route.label || "综合客服")}</span>`;
+}
+const SPECIALIST_COLORS = {
+  complaint: "#e8590c", billing: "#0b7285", after_sales: "#5f3dc4",
+  logistics: "#2b8a3e", shopping: "#d9480f", policy: "#1864ab", general: "#1a73e8",
+};
+
+function showSpecBadge(route) {
+  document.getElementById("specBadge").innerHTML = specChip(route);
 }
 
 /* ---------------- 消息渲染 ---------------- */
-function addMessage(role, content, tools) {
+function addMessage(role, content, tools, route) {
   document.getElementById("emptyState").style.display = "none";
   $inner.style.display = "";
   const div = document.createElement("div");
@@ -156,11 +184,13 @@ function addMessage(role, content, tools) {
     const label = typeof t === "string" ? (TOOL_LABELS[t] || t) : t;
     return `<span class="tool-chip done">🔧 ${escapeHtml(label)}</span>`;
   }).join("");
+  const routeLine = (role === "assistant" && route && route.specialist)
+    ? `<div class="cv-route">${specChip(route)}</div>` : "";
   div.innerHTML = `
     <div class="m-avatar">${role === "user" ? "🙋" : "🤖"}</div>
     <div class="m-body">
       <div class="m-name">${role === "user" ? escapeHtml(me.display_name || "我") : "小铺智答"}</div>
-      <div class="tool-chips">${chips}</div>
+      ${role === "assistant" ? `<div class="tool-chips">${chips}</div>${routeLine}` : ""}
       <div class="bubble">${role === "user" ? escapeHtml(content) : renderMarkdown(content)}</div>
     </div>`;
   $inner.appendChild(div);
@@ -168,9 +198,7 @@ function addMessage(role, content, tools) {
   return div;
 }
 
-function scrollBottom() {
-  $scroll.scrollTop = $scroll.scrollHeight;
-}
+function scrollBottom() { $scroll.scrollTop = $scroll.scrollHeight; }
 
 /* ---------------- 发送 & SSE ---------------- */
 async function send() {
@@ -183,29 +211,27 @@ async function send() {
     await loadSessions();
   }
   sending = true;
-  $input.value = "";
-  autoGrow();
+  $input.value = ""; autoGrow();
   document.getElementById("btnSend").disabled = true;
   addMessage("user", text, []);
 
-  // 占位：状态行 + 工具 chips 容器 + typing 气泡
   const holder = document.createElement("div");
   holder.className = "msg assistant";
   holder.innerHTML = `
     <div class="m-avatar">🤖</div>
     <div class="m-body">
       <div class="m-name">小铺智答</div>
-      <div class="status-line" id="statusLine">正在思考…</div>
+      <div class="route-line" id="routeLine"><span class="spin-dot"></span> 正在识别意图，分派专家…</div>
       <div class="tool-chips" id="liveChips"></div>
       <div class="bubble"><span class="typing"><i></i><i></i><i></i></span></div>
     </div>`;
   $inner.appendChild(holder);
   scrollBottom();
 
-  const statusLine = holder.querySelector("#statusLine");
+  const routeLine = holder.querySelector("#routeLine");
   const chipsBox = holder.querySelector("#liveChips");
   const bubble = holder.querySelector(".bubble");
-  const toolLabels = [];
+  let route = null;
 
   try {
     const resp = await fetch("/api/chat/stream", {
@@ -234,16 +260,22 @@ async function send() {
         let ev;
         try { ev = JSON.parse(payload); } catch { continue; }
 
-        if (ev.type === "llm_thinking") {
-          statusLine.textContent = ev.round > 1 ? `第 ${ev.round} 轮分析中…` : "正在思考…";
+        if (ev.type === "route") {
+          route = ev;
+          routeLine.innerHTML = specChip(ev) +
+            `<span style="color:var(--text-3)">已分派专家（意图：${escapeHtml(ev.intent)}）</span>`;
+          showSpecBadge(ev);
+        } else if (ev.type === "compress") {
+          routeLine.innerHTML = `<span class="spin-dot"></span> 已将 ${ev.compressed_turns} 轮早期对话压缩为长期摘要（记忆优化）`;
+        } else if (ev.type === "llm_thinking") {
+          routeLine.innerHTML = (route ? specChip(route) : "") +
+            `<span style="color:var(--text-3)">${ev.round > 1 ? "第 " + ev.round + " 轮分析中…" : "专家思考中…"}</span>`;
         } else if (ev.type === "tool_start") {
           const label = TOOL_LABELS[ev.tool] || ev.tool;
-          toolLabels.push(label);
           const chip = document.createElement("span");
           chip.className = "tool-chip running";
           chip.innerHTML = `<span class="spin"></span> ${escapeHtml(label)}`;
           chipsBox.appendChild(chip);
-          statusLine.textContent = "调用工具：" + label;
           scrollBottom();
         } else if (ev.type === "tool_end") {
           const last = chipsBox.lastElementChild;
@@ -253,21 +285,21 @@ async function send() {
             last.title = (ev.summary || "").slice(0, 160);
           }
         } else if (ev.type === "generating") {
-          statusLine.textContent = "正在组织回复…";
+          routeLine.innerHTML = (route ? specChip(route) : "") +
+            `<span style="color:var(--text-3)">正在组织回复…</span>`;
         } else if (ev.type === "error") {
           throw new Error(ev.message || "服务异常");
         } else if (ev.type === "answer") {
-          statusLine.remove();
+          routeLine.innerHTML = route ? specChip(route) : "";
           bubble.innerHTML = renderMarkdown(ev.answer);
           scrollBottom();
         }
       }
     }
-    // 刷新侧边栏标题（新对话首条消息后会更新）
-    if (!sessions.find(s => s.id === currentSession)) await loadSessions();
-    else await loadSessions();
+    await loadSessions();
+    refreshMemHint();
   } catch (e) {
-    statusLine.remove();
+    routeLine.remove();
     bubble.classList.add("error");
     bubble.textContent = "回复失败：" + e.message + "（请重试，或回复\"转人工\"）";
   } finally {
@@ -277,9 +309,55 @@ async function send() {
   }
 }
 
+/* ---------------- AI 记忆抽屉 ---------------- */
+async function refreshMemHint() {
+  try {
+    const d = await API.get("/api/memory");
+    const bits = [];
+    if (d.profile.identity) bits.push(d.profile.identity);
+    if (d.profile.preferences?.length) bits.push(d.profile.preferences.length + " 项偏好");
+    if (d.profile.history_issues?.length) bits.push(d.profile.history_issues.length + " 条历史诉求");
+    if (d.summaries?.length) bits.push(d.summaries.length + " 份会话摘要");
+    document.getElementById("memHint").textContent =
+      bits.length ? bits.join(" · ") : "画像与会话摘要";
+  } catch {}
+}
+
+async function openMemory() {
+  document.getElementById("drawerMask").classList.add("open");
+  document.getElementById("drawer").classList.add("open");
+  const box = document.getElementById("drawerBody");
+  box.innerHTML = "<p class='mem-empty'>加载中…</p>";
+  const d = await API.get("/api/memory");
+  const p = d.profile || {};
+  const sec = (title, inner) =>
+    `<div class="mem-section"><h4>${title}</h4>${inner}</div>`;
+  const listHtml = (arr) => arr?.length
+    ? arr.map(x => `<span class="tag">${escapeHtml(x)}</span>`).join("") || "<span class='mem-empty'>暂无</span>"
+    : "<span class='mem-empty'>暂无</span>";
+  let html = sec("🪪 用户画像（长期记忆）", `
+    <div class="mem-card">
+      <b>身份：</b>${p.identity ? escapeHtml(p.identity) : "<span class='mem-empty'>暂无</span>"}<br>
+      <b>偏好：</b>${listHtml(p.preferences)}<br>
+      <b>历史诉求：</b><br>${p.history_issues?.length ? p.history_issues.map(x => "· " + escapeHtml(x)).join("<br>") : "<span class='mem-empty'>暂无</span>"}<br>
+      <b>其他记忆：</b>${listHtml(p.notes)}
+    </div>`);
+  html += sec("📄 会话摘要（压缩记忆）", d.summaries?.length
+    ? d.summaries.map(s => `<div class="mem-card"><b>${escapeHtml(s.title)}</b>
+        <div class="sub" style="color:var(--text-3);font-size:11.5px;margin:2px 0 6px">${escapeHtml(s.updated_at)}</div>
+        ${escapeHtml(s.summary)}</div>`).join("")
+    : "<span class='mem-empty'>暂无。对话超过 15 轮后，最早的 10 轮会自动压缩成摘要存放在这里。</span>");
+  box.innerHTML = html;
+}
+function closeMemory() {
+  document.getElementById("drawerMask").classList.remove("open");
+  document.getElementById("drawer").classList.remove("open");
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeMemory(); });
+
 function autoGrow() {
   $input.style.height = "auto";
-  $input.style.height = Math.min($input.scrollHeight, 130) + "px";
+  $input.style.height = Math.min($input.scrollHeight, 140) + "px";
 }
 $input.addEventListener("input", autoGrow);
 $input.addEventListener("keydown", e => {

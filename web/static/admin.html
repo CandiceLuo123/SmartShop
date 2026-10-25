@@ -242,6 +242,9 @@ async function viewChat(sid) {
         <div class="chat-view-item">
           <div class="role-tag ${m.role === "user" ? "user" : "bot"}">${m.role === "user" ? "顾客" : "客服AI"}</div>
           <div class="cv-content">${m.role === "user" ? escapeHtml(m.content) : renderMarkdown(m.content)}
+            ${m.role === "assistant" && (m.route || {}).specialist ? `<div class="cv-route">
+              <span class="spec-chip" style="background:${(SPECIALIST_COLORS[m.route.specialist] || "#1a73e8")}18;color:${SPECIALIST_COLORS[m.route.specialist] || "#1a73e8"}">${m.route.emoji || "🤖"} ${escapeHtml(m.route.label || m.route.specialist)}<span style="opacity:.65;font-weight:400">（意图：${escapeHtml(m.route.intent)}）</span></span>
+            </div>` : ""}
             ${m.role === "assistant" && (m.tools || []).length ? `<div class="cv-tools">
               ${(m.tools || []).map(t => `<span class="tool-chip done">🔧 ${escapeHtml(TOOL_LABELS[t] || t)}</span>`).join("")}
             </div>` : ""}
@@ -256,6 +259,11 @@ async function viewChat(sid) {
 const RENDERERS = { overview: renderOverview, orders: renderOrders, tickets: renderTickets,
                     customers: renderCustomers, products: renderProducts, chats: renderChats };
 async function render(tab) { try { await RENDERERS[tab](); } catch (e) { toast(e.message); } }
+
+const SPECIALIST_COLORS = {
+  complaint: "#e8590c", billing: "#0b7285", after_sales: "#5f3dc4",
+  logistics: "#2b8a3e", shopping: "#d9480f", policy: "#1864ab", general: "#1a73e8",
+};
 </script>
 </body>
 </html>

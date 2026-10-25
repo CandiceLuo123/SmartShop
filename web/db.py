@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     user_id       INTEGER NOT NULL,
     title         TEXT DEFAULT '新对话',
     messages_json TEXT DEFAULT '[]',   -- AgentSession.messages 完整快照
+    summary       TEXT DEFAULT '',     -- L2 会话摘要（压缩记忆持久化）
     created_at    TEXT,
     updated_at    TEXT
 );
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     content     TEXT,
     tools       TEXT DEFAULT '[]',      -- 该轮调用的工具名列表
     trace_json  TEXT DEFAULT '[]',      -- 工具轨迹（商家端可查）
+    route_json  TEXT DEFAULT '[]',      -- 意图路由结果（专家/意图）
     created_at  TEXT
 );
 """
@@ -78,9 +80,18 @@ def next_customer_id(conn: sqlite3.Connection) -> str:
 
 
 def ensure_schema() -> None:
-    """建表 + 首次种子账号（幂等）。"""
+    """建表 + 首次种子账号（幂等）+ 旧库列迁移。"""
+    from src import memory as memory_mod
     with closing(connect()) as conn:
         conn.executescript(SCHEMA)
+        memory_mod.ensure_memory_tables(conn)
+        # 旧库迁移：chat_sessions 补 summary 列（会话摘要，L2 记忆持久化）
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(chat_sessions)")}
+        if "summary" not in cols:
+            conn.execute("ALTER TABLE chat_sessions ADD COLUMN summary TEXT DEFAULT ''")
+        mcols = {r[1] for r in conn.execute("PRAGMA table_info(chat_messages)")}
+        if "route_json" not in mcols:
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN route_json TEXT DEFAULT '[]'")
         existing = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if existing == 0:
             from web.auth import hash_password, new_salt

@@ -33,13 +33,18 @@ def _squeeze(text: str) -> str:
 
 
 def grade(case: dict, result: dict) -> tuple[bool, list[str]]:
-    """按用例 checks 评分：工具调用、关键词（组内任一命中）、禁用表述。"""
+    """按用例 checks 评分：路由、工具调用、关键词（组内任一）、禁用表述。"""
     checks = case.get("checks", {})
     reasons = []
     ok = True
     tools = result.get("tool_calls") or []
     answer = result.get("answer") or ""
+    route = (result.get("route") or {}).get("specialist")
 
+    for r in checks.get("expect_route", []):
+        if route != r:
+            ok = False
+            reasons.append(f"路由错误: 期望 {r}，实际 {route}")
     for t in checks.get("expect_tools", []):
         if t not in tools:
             ok = False
@@ -57,6 +62,39 @@ def grade(case: dict, result: dict) -> tuple[bool, list[str]]:
             ok = False
             reasons.append(f"出现禁用表述: {k}")
 
+    if result.get("status") != "ok":
+        ok = False
+        reasons.append(
+            f"运行状态异常: {result.get('status')} {result.get('error') or ''}".strip())
+    return ok, reasons
+
+
+def routes_ok(turn: dict, result: dict) -> bool:
+    """单轮路由断言（多轮用例内部使用）。"""
+    expect = turn.get("expect_route")
+    if not expect:
+        return True
+    return (result.get("route") or {}).get("specialist") == expect
+
+
+def grade_multi_turn(case: dict, result: dict) -> tuple[bool, list[str]]:
+    """多轮 E2E 评分：逐轮路由 + 最终回答关键词/禁用词 + 运行状态。"""
+    reasons = []
+    ok = True
+    for i, r in enumerate(result.get("routes") or []):
+        if not r["match"]:
+            ok = False
+            reasons.append(f"第{i + 1}轮路由错误: 期望 {r['expect']}，实际 {r['route']}")
+    answer = result.get("answer") or ""
+    checks = case.get("checks", {})
+    for group in checks.get("expect_keywords_any", []):
+        if not any(k in answer or _squeeze(k) in _squeeze(answer) for k in group):
+            ok = False
+            reasons.append("最终回答缺少关键词(任一): " + "/".join(group))
+    for k in checks.get("forbid_keywords", []):
+        if k in answer or _squeeze(k) in _squeeze(answer):
+            ok = False
+            reasons.append(f"出现禁用表述: {k}")
     if result.get("status") != "ok":
         ok = False
         reasons.append(
@@ -126,26 +164,47 @@ def main() -> None:
     }
     write_out(out_path, doc)  # 开跑先落盘（running 状态）
 
-    print(f"{'用例':<28}{'结果':<6}{'轮次':<4}{'工具':<6}耗时ms")
-    print("-" * 72)
+    print(f"{'用例':<28}{'结果':<6}{'路由':<13}{'轮次':<4}{'工具':<5}耗时ms")
+    print("-" * 86)
     for case in cases:
         t0 = time.time()
         session = AgentSession(cfg, llm, customer_id=case.get("customer_id"))
-        result = session.run(case["message"])
-        elapsed_ms = int((time.time() - t0) * 1000)
-        passed, reasons = grade(case, result)
+        routes, last_result = [], None
+        if case.get("type") == "multi_turn":
+            # 端到端多轮：逐轮发送，收集每轮路由，最后一轮参与评分
+            for turn in case["turns"]:
+                last_result = session.run(turn["message"])
+                routes.append({
+                    "message": turn["message"],
+                    "route": (last_result.get("route") or {}).get("specialist"),
+                    "expect": turn.get("expect_route"),
+                    "match": routes_ok(turn, last_result),
+                })
+            result = dict(last_result or {})
+            result["routes"] = routes
+            elapsed_ms = int((time.time() - t0) * 1000)
+            passed, reasons = grade_multi_turn(case, result)
+        else:
+            result = session.run(case["message"])
+            elapsed_ms = int((time.time() - t0) * 1000)
+            passed, reasons = grade(case, result)
         if result.get("model") and not doc["model"]:
             doc["model"] = result["model"]
 
         doc["cases"].append({
             "id": case["id"],
             "scenario": case.get("scenario", ""),
+            "type": case.get("type", "single_turn"),
             "customer_id": case.get("customer_id"),
-            "message": case["message"],
+            "message": case.get("message") or " → ".join(
+                t["message"] for t in case.get("turns", [])),
+            "turns": (case.get("turns") if case.get("type") == "multi_turn" else None),
+            "routes": result.get("routes"),
             "expect": case.get("expect", ""),
             "pass": passed,
             "reasons": reasons,
             "answer": result["answer"],
+            "route": result.get("route"),
             "status": result["status"],
             "error": result["error"],
             "tool_calls": result["tool_calls"],
@@ -159,7 +218,10 @@ def main() -> None:
 
         mark = "PASS" if passed else "FAIL"
         tools = ",".join(dict.fromkeys(result["tool_calls"])) or "-"
-        print(f"{case['id']:<28}{mark:<6}{result['rounds']:<4}{len(result['tool_calls']):<6}{elapsed_ms}")
+        route = (result.get("route") or {}).get("specialist") or "-"
+        multi = " multi×%d" % len(result["routes"]) if result.get("routes") else ""
+        print(f"{case['id']:<28}{mark:<6}{route:<13}{result['rounds']:<4}"
+              f"{len(result['tool_calls']):<5}{elapsed_ms}{multi}")
         if not passed:
             for r in reasons:
                 print(f"    ✗ {r}")
@@ -170,7 +232,7 @@ def main() -> None:
     write_out(out_path, doc)
 
     s = doc["summary"]
-    print("-" * 72)
+    print("-" * 86)
     print(f"完成: {s['total']} 个用例，通过 {s['passed']}，失败 {s['failed']}"
           f"（通过率 {s['pass_rate']}，backend={effective}）")
     print(f"结果已写入: {out_path}")

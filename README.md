@@ -1,9 +1,38 @@
-# 小铺智答 —— 智谱 GLM 驱动的智能电商客服 Agent 平台
+# 小铺智答 —— 智谱 GLM 驱动的多专家电商客服 Agent 平台
 
-一个**核心零框架**（Agent 循环纯 Python 标准库，Web 层仅用 FastAPI）的智能电商客服平台：
-顾客注册登录后与 GLM Agent 实时对话（可看到工具调用进度），商家后台查看经营数据与会话审查。
+多 Agent 架构：**意图识别路由 + 7 个专家客服 + 三层记忆**，顾客注册登录后与 AI 实时对话
+（可看到"正在分派专家→工具调用→回复"全过程），商家后台查看经营数据与会话审查。
 
-## Web 平台（推荐入口）
+## 核心架构
+
+### 多专家路由（src/router.py）
+每轮消息先由轻量 LLM 分类器（失败时规则兜底）识别意图，路由到对应专家接管：
+
+| 意图 | 专家 | 工具白名单 |
+| --- | --- | --- |
+| complaint 投诉 | 🧡 投诉处理专员（安抚+高优工单） | 查订单 / 知识库 / 工单 |
+| after_sales 售后 | 🛠️ 售后专员（政策校验引擎） | 售后校验 / 查订单 / 知识库 |
+| billing 账单 | 💰 账单专员（退款/价保/发票） | 查订单 / 知识库 / 工单 |
+| logistics 物流 | 🚚 物流专员（查件/改地址） | 查订单 / 工单 / 知识库 |
+| shopping 购物 | 🛍️ 导购顾问（推荐/库存） | 推荐 / 查商品 |
+| policy 政策 | 📋 政策顾问（规则咨询） | 知识库 |
+| general | 🤖 综合客服（兜底） | 全部工具 |
+
+专家共享同一份对话历史与记忆（切换专家 = 切换人设 + 工具白名单），意图与专家徽章在聊天界面实时可见。
+
+### 三层记忆（src/memory.py）
+- **L1 会话记忆**：messages 全量保留最近对话。
+- **L2 会话摘要**：user 轮数超过 15 时，自动把最早 10 轮用 LLM 压缩成摘要
+  （保留订单号/承诺/未解决问题），替换进上下文并持久化到 `chat_sessions.summary`。
+- **L3 用户画像**：跨会话长期记忆（身份/偏好/历史诉求），每 3 轮 LLM 增量更新到
+  `memory_profiles` 表，注入 system prompt，换会话也认识这位顾客。
+
+### 端到端测评（run_tests.py + tests/cases.json）
+单轮用例断言路由正确性（`expect_route`）+ 工具调用 + 关键词 + 禁用承诺；
+`multi_turn` 用例逐轮发送（投诉→记忆延续→账单切换），逐轮断言路由、
+在最终回答中验证跨轮记忆。`python run_tests.py` 一键回归。
+
+## Web 平台
 
 ```bash
 pip install fastapi uvicorn   # Web 层唯一依赖
@@ -13,16 +42,15 @@ python run_web.py             # 启动：http://127.0.0.1:8000
 | 页面 | 地址 | 说明 |
 | --- | --- | --- |
 | 登录/注册 | `/login` | 顾客自助注册；内置演示账号见下 |
-| 顾客聊天 | `/` | ZCode 风格：深色侧边栏会话列表 + 气泡 + **实时工具轨迹 chips**（"🔧 查询订单"→"🔧 检索知识库"）+ Markdown 渲染 |
-| 商家后台 | `/admin` | 经营概览（订单分布/低库存预警）、订单、售后工单（可改状态）、顾客档案、商品库存、**客服会话审查**（完整对话+Agent 工具轨迹） |
+| 顾客聊天 | `/` | Gemini 式界面：会话侧栏 + **意图路由徽章** + 工具轨迹 chips + **AI 记忆抽屉**（画像/摘要可视化） |
+| 商家后台 | `/admin` | 经营概览、订单、售后工单、顾客档案、商品库存、会话审查（含每轮意图路由记录） |
 
 演示账号：顾客 `c001 / demo1234`（张伟）、`c003 / demo1234`（王芳）；商家 `admin / admin123`。
-新注册顾客自动生成 `U0001` 型顾客ID并建档。
 
-**技术要点**：聊天走 SSE 流式接口（`POST /api/chat/stream`），逐轮推送
-`llm_thinking → tool_start → tool_end → answer` 事件，前端实时显示 Agent 每一步在做什么；
-认证为 PBKDF2 密码哈希 + HMAC 签名 Token（`web/auth.py`，零第三方依赖）；
-会话完整 messages 快照存 SQLite，刷新/换设备后上下文无缝恢复。
+**技术要点**：聊天走 SSE 流式接口，逐轮推送
+`route（意图分派） → tool_start → tool_end → compress（记忆压缩） → answer` 事件；
+认证为 PBKDF2 密码哈希 + HMAC 签名 Token；会话快照 + 摘要 + 画像全部落 SQLite，
+刷新/换设备后上下文与记忆无缝恢复。
 
 ## 与原方法（图片五步）的对应关系
 
@@ -86,7 +114,9 @@ python -c "import json;d=json.load(open('results/results.json',encoding='utf-8')
 │       └── products_extra.md      # 商品使用注意事项（鼓包处置等）
 ├── prompts/system_prompt.md  # 客服人设/工具规范/政策红线/安全边界
 ├── src/
-│   ├── agent.py           # Agent 循环（run 同步 / run_iter 事件流，Web SSE 复用）
+│   ├── agent.py           # Agent 循环（路由切换专家 + run/run_iter 双接口）
+│   ├── router.py          # 意图分类器（LLM+规则兜底）+ 7 专家定义（persona/工具白名单）
+│   ├── memory.py          # 三层记忆：会话压缩摘要 + 用户画像
 │   ├── llm.py             # GLM 调用（模型回退/重试/.env）+ 离线 Mock 自检后端
 │   └── tools.py           # 6 个工具 + 售后政策引擎（签收天数自动计算）
 ├── tests/cases.json       # 12 个真实场景用例（含自动评分断言）

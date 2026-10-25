@@ -15,8 +15,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from . import memory, router
 from .llm import build_llm
-from .tools import execute_tool, get_customer_profile, tools_schema
+from .tools import execute_tool, get_customer_profile
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,26 +30,48 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def build_system_prompt(cfg: dict, customer_id: str | None) -> str:
+def build_system_prompt(cfg: dict, customer_id: str | None,
+                        specialist: str = "general",
+                        profile: dict | None = None) -> str:
+    """系统提示词 = 通用守则基底 + 专家 persona（追加在末尾，指令权重高）+ 画像。"""
     text = (ROOT / cfg["paths"]["system_prompt"]).read_text(encoding="utf-8")
     text = text.replace("{today}", cfg["today"])
     if customer_id:
         block = get_customer_profile(customer_id, cfg)
     else:
         block = "（未识别顾客身份；顾客查询订单时请其提供订单号，勿猜测订单归属）"
-    return text.replace("{customer_block}", block)
+    text = text.replace("{customer_block}", block)
+    spec = router.SPECIALISTS.get(specialist) or router.SPECIALISTS["general"]
+    text += (f"\n\n# 当前场景模式（意图路由结果）\n"
+             f"当前由 {spec['emoji']} {spec['label']} 接管本轮回答。\n"
+             f"{spec['persona'].strip()}")
+    text += memory.render_profile_block(profile or {})
+    return text
 
 
 class AgentSession:
-    """一次会话（多轮共享 messages）。run() 返回结构化结果并维护轨迹。"""
+    """一次会话（多轮共享 messages）。run() 返回结构化结果并维护轨迹。
 
-    def __init__(self, cfg: dict, llm, customer_id: str | None = None):
+    路由：每轮先意图分类，切换到对应专家（专属 persona + 工具白名单）。
+    记忆：L1 messages 全量；L2 超阈值自动压缩成摘要；L3 用户画像由外部注入。
+    """
+
+    def __init__(self, cfg: dict, llm, customer_id: str | None = None,
+                 profile: dict | None = None):
         self.cfg = cfg
         self.llm = llm
         self.customer_id = customer_id
         self.max_rounds = cfg["agent"]["max_rounds"]
+        self.specialist = "general"
+        self.profile = profile or {}
+        self.session_summary = ""
         self.messages = [
-            {"role": "system", "content": build_system_prompt(cfg, customer_id)}]
+            {"role": "system", "content": build_system_prompt(
+                cfg, customer_id, self.specialist, self.profile)}]
+
+    def _refresh_system(self) -> None:
+        self.messages[0] = {"role": "system", "content": build_system_prompt(
+            self.cfg, self.customer_id, self.specialist, self.profile)}
 
     def run(self, user_message: str) -> dict:
         """同步接口（CLI/评测用）：消费事件流并返回最终结果。"""
@@ -58,25 +81,41 @@ class AgentSession:
                 result = event["result"]
         return result or {"answer": FALLBACK_ANSWER, "status": "error",
                           "error": "未产生结果", "rounds": 0, "tool_calls": [],
-                          "trace": [], "model": None}
+                          "trace": [], "model": None, "route": None}
 
     def run_iter(self, user_message: str):
         """
         事件流接口（Web SSE 用）：逐轮 yield 进度事件，最后 yield result。
-        事件类型：user_echo / llm_thinking / tool_start / tool_end /
-                  generating / answer / result
+        事件类型：route / user_echo / llm_thinking / tool_start / tool_end /
+                  compress / generating / answer / result
         """
+        # 1) 意图路由 + 专家切换
+        route = router.classify(self.llm, user_message,
+                                context_hint=self.session_summary[:120])
+        self.specialist = route["specialist"]
+        self._refresh_system()
+        spec = router.SPECIALISTS[self.specialist]
+        yield {"type": "route", "intent": route["intent"],
+               "specialist": self.specialist, "label": spec["label"],
+               "emoji": spec["emoji"], "via": route["via"]}
+
+        # 2) 记忆压缩（在追加新消息前处理历史）
+        compression = memory.apply_compression(self.llm, self)
+        if compression:
+            yield {"type": "compress", **compression}
+
         self.messages.append({"role": "user", "content": user_message})
         yield {"type": "user_echo", "message": user_message}
         trace, tool_names = [], []
         status, answer, error = "ok", None, None
         rounds = 0
+        tools = router.tools_for(self.specialist)
 
         for rnd in range(1, self.max_rounds + 1):
             rounds = rnd
             yield {"type": "llm_thinking", "round": rnd}
             try:
-                resp = self.llm.complete(self.messages, tools_schema())
+                resp = self.llm.complete(self.messages, tools)
             except Exception as e:  # noqa: BLE001 —— headless 运行，失败也要落盘
                 status, error = "llm_error", f"{type(e).__name__}: {e}"
                 break
@@ -137,6 +176,10 @@ class AgentSession:
             "tool_calls": tool_names,
             "trace": trace,
             "model": getattr(self.llm, "model_in_use", None),
+            "route": {"intent": route["intent"], "specialist": self.specialist,
+                      "label": spec["label"], "emoji": spec["emoji"],
+                      "via": route["via"]},
+            "compressed_turns": (compression or {}).get("compressed_turns", 0),
         }}
 
 
