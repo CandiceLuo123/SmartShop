@@ -20,7 +20,7 @@ DB_PATH = ROOT / "data" / "shop.db"
 # 触发参数（config.json agent 段可覆盖）
 COMPRESS_AFTER_USER_TURNS = 15   # user 消息超过此数触发压缩
 COMPRESS_USER_TURNS = 10         # 每次压缩最早的多少轮 user 消息
-PROFILE_UPDATE_EVERY = 5         # 每完成多少轮对话增量更新一次画像
+PROFILE_UPDATE_EVERY = 3         # 每完成多少轮对话增量更新一次画像
 
 PROFILE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_profiles (

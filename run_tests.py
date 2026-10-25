@@ -45,6 +45,10 @@ def grade(case: dict, result: dict) -> tuple[bool, list[str]]:
         if route != r:
             ok = False
             reasons.append(f"路由错误: 期望 {r}，实际 {route}")
+    for group in checks.get("expect_route_any", []):
+        if route not in group:
+            ok = False
+            reasons.append(f"路由错误: 期望 {'/'.join(group)} 之一，实际 {route}")
     for t in checks.get("expect_tools", []):
         if t not in tools:
             ok = False

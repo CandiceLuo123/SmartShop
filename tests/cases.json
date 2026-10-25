@@ -84,9 +84,9 @@
       "scenario": "发货时效FAQ：路由政策顾问",
       "customer_id": "C006",
       "message": "一般下单后多久能发货？都发什么快递呀？",
-      "expect": "路由 policy；48小时发货；中通/圆通随机不支持指定",
+      "expect": "路由 policy/logistics 皆可（通用时效咨询两类专家都能正确处理）；48小时发货；中通/圆通随机不支持指定",
       "checks": {
-        "expect_route": ["policy"],
+        "expect_route_any": [["policy", "logistics"]],
         "expect_tools_any": [["search_knowledge"]],
         "expect_keywords_any": [["48小时", "48 小时", "两个工作日", "2个工作日"], ["中通", "圆通", "京东"]],
         "forbid_keywords": []

@@ -64,6 +64,7 @@ class AgentSession:
         self.max_rounds = cfg["agent"]["max_rounds"]
         self.specialist = "general"
         self.profile = profile or {}
+        self.profile_turns = 0          # 距上次画像更新的轮数（Web 层读写）
         self.session_summary = ""
         self.messages = [
             {"role": "system", "content": build_system_prompt(

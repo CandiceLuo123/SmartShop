@@ -250,7 +250,6 @@ async def chat_stream(request: Request):
         return JSONResponse({"detail": "会话不存在"}, status_code=404)
 
     agent = _get_agent(sid, user)
-    turn_counter = {"n": 0}
 
     def event_gen():
         result = None
@@ -259,8 +258,6 @@ async def chat_stream(request: Request):
                 if event["type"] == "result":
                     result = event["result"]
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                if event["type"] == "compress":
-                    turn_counter["n"] = 0  # 压缩后重新计数，立即刷新一次画像
         except Exception as e:  # noqa: BLE001 —— 出错也要让前端收到失败事件
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
         # 持久化（失败也落盘）：消息、上下文快照、会话摘要、画像增量更新
@@ -291,10 +288,10 @@ async def chat_stream(request: Request):
                     "UPDATE chat_sessions SET title=? WHERE id=? AND title='新对话'",
                     (title, sid))
                 conn.commit()
-            # L3 画像：每 N 轮增量更新一次（写库失败不影响对话）
-            turn_counter["n"] += 1
-            if user["id"] and turn_counter["n"] >= memory.PROFILE_UPDATE_EVERY:
-                turn_counter["n"] = 0
+            # L3 画像：每 N 轮增量更新一次（计数存会话实例，跨请求累计；失败不影响对话）
+            agent.profile_turns += 1
+            if user["id"] and agent.profile_turns >= memory.PROFILE_UPDATE_EVERY:
+                agent.profile_turns = 0
                 try:
                     agent.profile = memory.update_profile(
                         _LLM, user["id"], user["customer_id"], message, answer)
