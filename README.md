@@ -39,6 +39,13 @@ pip install fastapi uvicorn   # Web 层唯一依赖
 python run_web.py             # 启动：http://127.0.0.1:8000
 ```
 
+对外访问：双击 `start_all.bat`（一键起服务+Cloudflare 公网隧道，GBK 编码），
+公网地址见"小铺智答-隧道"窗口；停止用 `stop_all.bat`。
+
+**接入真实数据**：见 [真实数据接入指南.md](真实数据接入指南.md)——
+`python data/make_templates.py` 生成 Excel 模板，填入真实商品/订单后
+`python data/import_real_data.py 文件.xlsx` 导入，AI 立即可查，无需改代码。
+
 | 页面 | 地址 | 说明 |
 | --- | --- | --- |
 | 登录/注册 | `/login` | 顾客自助注册；内置演示账号见下 |
