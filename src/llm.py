@@ -5,6 +5,7 @@ LLM 后端：
               支持模型回退列表、429/5xx 重试、Key 从环境变量或 .env 读取。
   MockLLM   —— 离线自检后端（不联网），用于在没有 Key 时验证 Agent 管道。
 """
+import http.client
 import json
 import os
 import re
@@ -89,11 +90,15 @@ class ZhipuLLM:
                 if e.code in (401, 403):
                     raise LLMError(f"认证失败(HTTP {e.code})，请检查 API Key：{body[:300]}")
                 if e.code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                    # 429 限流需要更长退避（等待配额窗口），其余网络错误短退避
                     last_err = LLMError(f"HTTP {e.code}: {body[:200]}")
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(6.0 * (attempt + 1) if e.code == 429
+                               else 1.5 * (attempt + 1))
                     continue
                 raise LLMError(f"HTTP {e.code}: {body[:300]}")
-            except urllib.error.URLError as e:
+            except (urllib.error.URLError, ConnectionError, OSError,
+                    http.client.IncompleteRead) as e:
+                # RemoteDisconnected/IncompleteRead/超时等网络层错误也重试
                 if attempt < self.max_retries:
                     last_err = LLMError(f"网络错误: {e}")
                     time.sleep(1.5 * (attempt + 1))

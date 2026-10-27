@@ -7,18 +7,47 @@
   "api": {
     "base_url": "https://open.bigmodel.cn/api/paas/v4",
     "key_env": ["ZHIPUAI_API_KEY", "GLM_API_KEY", "ZHIPU_API_KEY", "BIGMODEL_API_KEY"],
-    "models": ["glm-4.7", "glm-4.6", "glm-4-plus", "glm-4-flash"],
+    "models": ["glm-5.3-flash", "glm-4.6", "glm-4-plus", "glm-4-flash"],
     "timeout_seconds": 60,
     "max_retries": 2
   },
   "agent": {
     "max_rounds": 6,
     "temperature": 0.3,
-    "max_tokens": 1024
+    "max_tokens": 4096
   },
   "paths": {
     "db": "data/shop.db",
     "knowledge_dir": "data/knowledge",
-    "system_prompt": "prompts/system_prompt.md"
+    "system_prompt": "prompts/system_prompt.md",
+    "skills_dir": "skills"
+  },
+  "database": {
+    "backend": "mysql",
+    "mysql": {
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "root",
+      "password_env": "MYSQL_PASSWORD",
+      "database": "xiaopu_shop",
+      "charset": "utf8mb4",
+      "pool_size": 8
+    }
+  },
+  "cache": {
+    "ttl_base_seconds": 300,
+    "ttl_jitter_seconds": 120,
+    "null_ttl_seconds": 60,
+    "max_items": 10000
+  },
+  "breaker": {
+    "failure_threshold": 5,
+    "recovery_seconds": 60,
+    "tool_timeout_seconds": 30
+  },
+  "rag": {
+    "rewrite_subqueries": 3,
+    "recall_top_k": 5,
+    "rerank_top_k": 3
   }
 }

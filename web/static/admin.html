@@ -23,7 +23,8 @@
       <div class="session-item" data-tab="tickets"><span>🎫</span><span class="s-title">售后工单</span></div>
       <div class="session-item" data-tab="customers"><span>👥</span><span class="s-title">顾客档案</span></div>
       <div class="session-item" data-tab="products"><span>🏷️</span><span class="s-title">商品库存</span></div>
-      <div class="session-item" data-tab="chats"><span>💬</span><span class="s-title">客服会话</span></div>
+    <div class="session-item" data-tab="chats"><span>💬</span><span class="s-title">客服会话</span></div>
+      <div class="session-item" data-tab="monitor"><span>📡</span><span class="s-title">系统监控</span></div>
     </div>
     <div class="sidebar-foot">
       <div class="avatar" style="background:linear-gradient(135deg,#4f46e5,#7c3aed)" id="uAvatar">商</div>
@@ -256,8 +257,60 @@ async function viewChat(sid) {
   box.scrollIntoView({ behavior: "smooth" });
 }
 
+/* ================= 系统监控 ================= */
+async function renderMonitor() {
+  const d = await API.get("/api/admin/monitor");
+  const sk = await API.get("/api/admin/skills");
+  const rate = s => `${(s.success_rate * 100).toFixed(0)}%`;
+  const statTable = (title, data, penalties) => `
+    <div class="panel"><h3>${title}</h3>
+      ${Object.keys(data).length ? `<table class="tbl">
+        <tr><th>名称</th><th>调用</th><th>成功率</th><th>平均耗时</th><th>连续失败</th><th>路由降权</th></tr>
+        ${Object.entries(data).map(([k, s]) => `<tr>
+          <td class="mono">${escapeHtml(k)}</td><td>${s.total}</td>
+          <td>${badge(rate(s) === "100%" ? "已签收" : rate(s) === "0%" ? "高" : "中").replace(rate(s) === "100%" ? "已签收" : rate(s) === "0%" ? "高" : "中", rate(s))}</td>
+          <td>${s.avg_ms}ms</td><td>${s.consecutive_fails}</td>
+          <td>${penalties[k] ? `<span class="badge badge-red">-${(penalties[k] * 100).toFixed(0)}%</span>` : '<span class="badge badge-green">正常</span>'}</td>
+        </tr>`).join("")}
+      </table>` : "<p style='color:var(--text-3)'>暂无调用数据（去顾客端聊几句就有了）</p>"}
+    </div>`;
+  $main.innerHTML = `
+    <div class="admin-head-row"><h2>系统监控</h2><div class="spacer"></div>
+      <button class="btn btn-ghost btn-sm" onclick="reloadSkills()">🔄 重载 Skills</button></div>
+    ${statTable("🤖 专家统计（连续失败自动降权路由）", d.agent_stats, d.penalties)}
+    ${statTable("🔧 工具统计（熔断器保护中）", d.tool_stats, {})}
+    <div class="panel"><h3>🚨 最近告警</h3>
+      ${d.active_alerts.length ? d.active_alerts.map(a => `
+        <div style="padding:10px 4px;border-bottom:1px solid #e8ebee">
+          <span class="badge ${a.level === "ERROR" ? "badge-red" : "badge-orange"}">${a.level}</span>
+          <b style="margin-left:8px">${escapeHtml(a.title)}</b>
+          <span style="color:var(--text-3);font-size:12.5px;margin-left:8px">${escapeHtml(a.detail)}</span>
+          <span style="float:right;color:var(--text-3);font-size:12px">${escapeHtml(a.time)}</span>
+        </div>`).join("") : "<p style='color:var(--ok)'>✅ 无告警，一切正常</p>"}
+    </div>
+    <div class="panel"><h3>🧩 Skills（动态注入，编辑 skills/ 目录后点"重载"即生效）</h3>
+      ${sk.errors.length ? `<div style="color:var(--danger);font-size:12.5px;margin-bottom:8px">解析错误: ${sk.errors.map(escapeHtml).join("; ")}</div>` : ""}
+      ${sk.skills.length ? `<table class="tbl">
+        <tr><th>Skill</th><th>说明</th><th>角色限定</th><th>关键词</th></tr>
+        ${sk.skills.map(s => `<tr>
+          <td><b>${escapeHtml(s.name)}</b><div class="sub">${escapeHtml(s.path)}</div></td>
+          <td style="max-width:260px">${escapeHtml(s.description)}</td>
+          <td>${s.agents.length ? s.agents.map(a => `<span class="badge badge-blue">${escapeHtml(a)}</span>`).join(" ") : '<span class="badge badge-purple">全局</span>'}</td>
+          <td style="max-width:220px;font-size:12px;color:var(--text-3)">${escapeHtml(s.keywords.join(" · ") || "任意消息注入")}</td>
+        </tr>`).join("")}
+      </table>` : "<p style='color:var(--text-3)'>skills/ 目录为空</p>"}
+    </div>`;
+}
+
+async function reloadSkills() {
+  const d = await API.post("/api/admin/skills/reload");
+  toast(`Skills 已重载：${d.skills} 个`);
+  render("monitor");
+}
+
 const RENDERERS = { overview: renderOverview, orders: renderOrders, tickets: renderTickets,
-                    customers: renderCustomers, products: renderProducts, chats: renderChats };
+                    customers: renderCustomers, products: renderProducts, chats: renderChats,
+                    monitor: renderMonitor };
 async function render(tab) { try { await RENDERERS[tab](); } catch (e) { toast(e.message); } }
 
 const SPECIALIST_COLORS = {

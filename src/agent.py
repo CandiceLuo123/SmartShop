@@ -15,7 +15,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import memory, router
+from . import memory, monitor, router
+from . import skills as skills_mod
+from . import tools
 from .llm import build_llm
 from .tools import execute_tool, get_customer_profile
 
@@ -23,6 +25,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 FALLBACK_ANSWER = ("非常抱歉，系统刚才开小差了，请您再描述一下问题？"
                    "如需人工服务，回复\"转人工\"，工作日 9:00-21:00 为您接入。")
+
+_SKILL_MANAGER: skills_mod.SkillManager | None = None
+
+
+def get_skill_manager(cfg: dict) -> skills_mod.SkillManager:
+    global _SKILL_MANAGER
+    if _SKILL_MANAGER is None:
+        _SKILL_MANAGER = skills_mod.SkillManager(
+            ROOT / cfg["paths"].get("skills_dir", "skills"))
+    return _SKILL_MANAGER
 
 
 def load_config() -> dict:
@@ -32,8 +44,9 @@ def load_config() -> dict:
 
 def build_system_prompt(cfg: dict, customer_id: str | None,
                         specialist: str = "general",
-                        profile: dict | None = None) -> str:
-    """系统提示词 = 通用守则基底 + 专家 persona（追加在末尾，指令权重高）+ 画像。"""
+                        profile: dict | None = None,
+                        message: str = "") -> str:
+    """系统提示词 = 通用守则 + 专家 persona + Skills（按角色/关键词匹配）+ 画像。"""
     text = (ROOT / cfg["paths"]["system_prompt"]).read_text(encoding="utf-8")
     text = text.replace("{today}", cfg["today"])
     if customer_id:
@@ -45,6 +58,9 @@ def build_system_prompt(cfg: dict, customer_id: str | None,
     text += (f"\n\n# 当前场景模式（意图路由结果）\n"
              f"当前由 {spec['emoji']} {spec['label']} 接管本轮回答。\n"
              f"{spec['persona'].strip()}")
+    skills_block = get_skill_manager(cfg).prompt_for(message, specialist)
+    if skills_block:
+        text += "\n\n" + skills_block
     text += memory.render_profile_block(profile or {})
     return text
 
@@ -70,9 +86,9 @@ class AgentSession:
             {"role": "system", "content": build_system_prompt(
                 cfg, customer_id, self.specialist, self.profile)}]
 
-    def _refresh_system(self) -> None:
+    def _refresh_system(self, message: str = "") -> None:
         self.messages[0] = {"role": "system", "content": build_system_prompt(
-            self.cfg, self.customer_id, self.specialist, self.profile)}
+            self.cfg, self.customer_id, self.specialist, self.profile, message)}
 
     def run(self, user_message: str) -> dict:
         """同步接口（CLI/评测用）：消费事件流并返回最终结果。"""
@@ -90,15 +106,21 @@ class AgentSession:
         事件类型：route / user_echo / llm_thinking / tool_start / tool_end /
                   compress / generating / answer / result
         """
-        # 1) 意图路由 + 专家切换
+        # 1) 意图路由 + 专家切换（含监控降权：被降权专家自动 fallback general）
         route = router.classify(self.llm, user_message,
                                 context_hint=self.session_summary[:120])
         self.specialist = route["specialist"]
-        self._refresh_system()
+        degraded = False
+        if monitor.penalty(self.specialist) >= 0.8 and self.specialist != "general":
+            degraded = True
+            self.specialist = "general"
+        self._refresh_system(user_message)  # 传入消息让 Skills 按关键词匹配
+        tools.set_rag_llm(self.llm)
         spec = router.SPECIALISTS[self.specialist]
         yield {"type": "route", "intent": route["intent"],
                "specialist": self.specialist, "label": spec["label"],
-               "emoji": spec["emoji"], "via": route["via"]}
+               "emoji": spec["emoji"], "via": route["via"],
+               "degraded": degraded}
 
         # 2) 记忆压缩（在追加新消息前处理历史）
         compression = memory.apply_compression(self.llm, self)
@@ -110,13 +132,14 @@ class AgentSession:
         trace, tool_names = [], []
         status, answer, error = "ok", None, None
         rounds = 0
-        tools = router.tools_for(self.specialist)
+        t_run = time.time()
+        tools_ = router.tools_for(self.specialist)
 
         for rnd in range(1, self.max_rounds + 1):
             rounds = rnd
             yield {"type": "llm_thinking", "round": rnd}
             try:
-                resp = self.llm.complete(self.messages, tools)
+                resp = self.llm.complete(self.messages, tools_)
             except Exception as e:  # noqa: BLE001 —— headless 运行，失败也要落盘
                 status, error = "llm_error", f"{type(e).__name__}: {e}"
                 break
@@ -169,6 +192,10 @@ class AgentSession:
         final_answer = answer if (answer and status == "ok") else (answer or FALLBACK_ANSWER)
 
         yield {"type": "answer", "answer": final_answer}
+        # 监控采集：本次会话运行结果记入当前专家的统计（供降权与告警）
+        ok = status == "ok"
+        monitor.STATS.record_agent(self.specialist, ok,
+                                   int((time.time() - t_run) * 1000))
         yield {"type": "result", "result": {
             "answer": final_answer,
             "status": status,

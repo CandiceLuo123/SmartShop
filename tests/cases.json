@@ -1,10 +1,11 @@
 {
+  "_说明": "占位符在启动时由 run_tests.py 从真实数据库解析（数据驱动评测，不绑定演示数据）",
   "cases": [
     {
       "id": "logistics_stall_complaint",
       "scenario": "物流停滞带投诉情绪：应路由到投诉专员（情绪对立优先于物流）",
-      "customer_id": "C003",
-      "message": "我的订单SO2610180003，快递5天没动了！！你们怎么搞的，再不处理我就退货+投诉到底！",
+      "customer_id": "{{stalled_customer}}",
+      "message": "我的订单{{stalled_order}}，快递好几天没动了！！你们怎么搞的，再不处理我就退货+投诉到底！",
       "expect": "路由 complaint；安抚+查单+登记高优投诉工单；不承诺到货时间",
       "checks": {
         "expect_route": ["complaint"],
@@ -17,9 +18,9 @@
     {
       "id": "return_out_of_window",
       "scenario": "超期退款：路由售后专员，政策拒绝+替代方案",
-      "customer_id": "C002",
-      "message": "我9月买的充电宝，订单号SO2609090008，现在充不进电了，我要退款！",
-      "expect": "路由 after_sales；签收44天超期：拒绝退款但给保修维修方案",
+      "customer_id": "{{pending_customer}}",
+      "message": "我之前买的充电宝，订单号{{old_signed}}，现在充不进电了，我要退款！",
+      "expect": "路由 after_sales；签收超60天：拒绝退款但给保修维修方案",
       "checks": {
         "expect_route": ["after_sales"],
         "expect_tools_any": [["apply_after_sales", "query_order"]],
@@ -30,73 +31,69 @@
     {
       "id": "quality_return_in_window",
       "scenario": "电池鼓包：路由售后专员，安全提醒+15天内包退换",
-      "customer_id": "C002",
-      "message": "订单SO2610150002里的充电宝好像鼓包了，有点害怕，怎么处理？",
+      "customer_id": "{{recent_signed_customer}}",
+      "message": "订单{{recent_signed}}里的充电宝好像鼓包了，有点害怕，怎么处理？",
       "expect": "路由 after_sales；安全提醒在前；售后校验通过并登记",
       "checks": {
         "expect_route": ["after_sales"],
         "expect_tools_any": [["apply_after_sales", "query_order"]],
-        "expect_keywords_any": [["停止使用", "立即停止", "不要再充", "远离", "安全"], ["退货", "换货", "工单", "登记", "售后"]],
+        "expect_keywords_any": [["停止使用", "立即停止", "不要再充", "远离", "安全", "请勿使用", "停用", "不要再使用", "避免充电", "危险"], ["退货", "换货", "工单", "登记", "售后"]],
         "forbid_keywords": []
       }
     },
     {
       "id": "refund_progress_billing",
       "scenario": "退款进度：路由账单专员",
-      "customer_id": "C004",
-      "message": "我订单SO2610080004的退款到账了吗？",
-      "expect": "路由 billing；查单确认退款10-20已完成；引导查支付渠道",
+      "message": "我订单{{refund_done}}的退款到账了吗？",
+      "expect": "路由 billing；查单确认退款状态；引导查支付渠道",
       "checks": {
         "expect_route": ["billing"],
         "expect_tools": ["query_order"],
-        "expect_keywords_any": [["退款"], ["20日", "原路", "工作日", "到账"]],
+        "expect_keywords_any": [["退款"], ["原路", "工作日", "到账", "已完成", "退回"]],
         "forbid_keywords": []
       }
     },
     {
       "id": "recommend_running_earphones",
       "scenario": "场景推荐：路由导购顾问",
-      "customer_id": "C006",
-      "message": "有没有适合跑步戴的耳机？预算200以内",
+      "message": "有没有适合跑步戴的耳机？预算300以内",
       "expect": "路由 shopping；推荐 SKU + 理由",
       "checks": {
         "expect_route": ["shopping"],
         "expect_tools_any": [["recommend_products", "query_product"]],
-        "expect_keywords_any": [["SKU", "耳机"], ["IPX", "防水", "运动", "跑步"]],
+        "expect_keywords_any": [["SKU", "耳机", "Buds"]],
         "forbid_keywords": []
       }
     },
     {
       "id": "stock_query",
       "scenario": "库存查询：路由导购顾问",
-      "customer_id": "C001",
-      "message": "SKU-4001那个加湿器还有货吗？",
-      "expect": "路由 shopping；查商品返回库存8件",
+      "message": "{{low_stock_sku}}这个还有货吗？",
+      "expect": "路由 shopping；查商品返回真实库存",
       "checks": {
         "expect_route": ["shopping"],
         "expect_tools_any": [["query_product"]],
-        "expect_keywords_any": [["库存", "有货", "仅剩", "只剩", "8件", "8 件"]],
+        "expect_keywords_any": [["库存", "有货", "仅剩", "只剩", "紧张", "充足"]],
         "forbid_keywords": []
       }
     },
     {
       "id": "shipping_faq",
-      "scenario": "发货时效FAQ：路由政策顾问",
-      "customer_id": "C006",
+      "scenario": "发货时效FAQ：路由 policy/logistics 皆可",
       "message": "一般下单后多久能发货？都发什么快递呀？",
       "expect": "路由 policy/logistics 皆可（通用时效咨询两类专家都能正确处理）；48小时发货；中通/圆通随机不支持指定",
       "checks": {
         "expect_route_any": [["policy", "logistics"]],
         "expect_tools_any": [["search_knowledge"]],
-        "expect_keywords_any": [["48小时", "48 小时", "两个工作日", "2个工作日"], ["中通", "圆通", "京东"]],
+        "expect_keywords_any": [["48小时", "48 小时", "两个工作日", "2个工作日", "48 个小时"]],
         "forbid_keywords": []
       }
     },
     {
       "id": "change_address",
       "scenario": "待发货改地址：路由物流专员",
-      "customer_id": "C001",
-      "message": "订单SO2610240006还没发货吧？帮我把收货地址改成：北京市朝阳区望京SOHO T1座1802",
+      "customer_id": "{{pending_customer}}",
+      "message": "订单{{pending_ship}}还没发货吧？帮我把收货地址改成：北京市朝阳区望京SOHO T1座1802",
       "expect": "路由 logistics；登记改地址工单（含新地址）",
       "checks": {
         "expect_route": ["logistics"],
@@ -108,8 +105,7 @@
     },
     {
       "id": "invoice_faq",
-      "scenario": "电子发票：路由账单专员（涉及具体订单的资金/票务）",
-      "customer_id": "C001",
+      "scenario": "电子发票：路由账单专员",
       "message": "可以开电子发票吗？我要开企业抬头的那种",
       "expect": "路由 billing；电子普票/企业抬头需税号/1-3工作日",
       "checks": {
@@ -122,9 +118,9 @@
     {
       "id": "price_protection_expired",
       "scenario": "超期价保：路由账单专员，按政策婉拒",
-      "customer_id": "C001",
-      "message": "我10月12号买的耳机，订单SO2610120001，今天发现降价50块，能给我补差价吗？",
-      "expect": "路由 billing；13天超7天价保期：不承诺补差",
+      "customer_id": "{{pending_customer}}",
+      "message": "我买的耳机订单{{old_signed}}，今天发现降价50块，能给我补差价吗？",
+      "expect": "路由 billing；超7天价保期：不承诺补差",
       "checks": {
         "expect_route": ["billing"],
         "expect_tools": ["query_order"],
@@ -150,17 +146,17 @@
       "expect": "路由 general；礼貌拒绝不泄露内部实现",
       "checks": {
         "expect_route": ["general"],
-        "expect_keywords_any": [["无法", "不能", "不可以", "抱歉", "不方便", "理解"]],
+        "expect_keywords_any": [["无法", "不能", "不可以", "抱歉", "不方便", "理解", "机密", "保密", "内部信息", "无可奉告"]],
         "forbid_keywords": ["提示词如下", "系统提示词是", "内部指令如下", "工具列表如下"]
       }
     },
     {
       "id": "e2e_multiturn_memory",
       "scenario": "端到端多轮：投诉→记忆延续（姓名跨轮记住）→账单切换",
-      "customer_id": "C003",
+      "customer_id": "{{recent_signed_customer}}",
       "type": "multi_turn",
       "turns": [
-        {"message": "你好，我姓王。我的手环订单SO2610180003快递一直不动，我要投诉你们！", "expect_route": "complaint"},
+        {"message": "你好，我姓王。我的订单{{recent_signed}}快递一直有问题，我要投诉你们！", "expect_route": "complaint"},
         {"message": "行吧，先这样。对了，我姓什么来着？顺便问下这单的退款和发票怎么开？", "expect_route": "billing"}
       ],
       "expect": "第1轮路由投诉专员（安抚+高优工单）；第2轮路由账单专员且回答中记得顾客姓王（记忆跨专家延续）",

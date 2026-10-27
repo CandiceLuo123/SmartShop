@@ -5,6 +5,41 @@
 
 ## 核心架构
 
+### 生产级可靠性层（借鉴多 Agent 平台设计）
+
+| 模块 | 防护的问题 | 实现 |
+| --- | --- | --- |
+| `src/cache.py` | 缓存**穿透**：查询不存在数据每次都打到库 | 空结果短 TTL 缓存（含 `found:false` 语义）+ 查询合法性校验（拒畸形/超长/注入特征） |
+| | 缓存**击穿**：热点 key 过期瞬间并发回源 | per-key 互斥锁，同 key 只有一个线程回源，其余 double-check 直接拿结果 |
+| | 缓存**雪崩**：大量 key 同时过期 | TTL = base + random(0, jitter) 打散过期时间 |
+| `src/breaker.py` | 依赖故障时持续浪费流量 | 三态熔断器 CLOSED→OPEN→HALF_OPEN：连续失败 5 次熔断，60s 半开探测；打开期间返回降级结果（工具不抛错，Agent 循环不中断） |
+| `src/tools.py` execute_tool | 慢调用拖死会话 | 线程池 + 超时控制（默认 30s），超时/异常/熔断统一走 fallback 降级文案 |
+| `src/monitor.py` | 某专家持续失败继续接流量 | 后台 10s 周期采集成功率/延迟 → 阈值告警 → 路由降权（penalty≥0.8 自动 fallback general）→ `/api/admin/monitor` |
+| `src/skills.py` + `skills/` | 业务规则改动要改代码重部署 | SKILL.md front matter（手写解析，不依赖 PyYAML）→ 按角色+关键词动态注入 system prompt（预算 5000 字符）→ `POST /api/admin/skills/reload` 热加载 |
+| `run_tests.py` 扩展评测 | 质量回归无量化 | 意图分类手写 Accuracy/P/R/F1/Macro-F1（不依赖 sklearn）+ LLM Judge 四维评分（及格线 0.75）+ 滚动基线回归检测（退化 >5% 告警，`results/baseline.json`） |
+
+### RAG 检索优化链路（`search_with_rewrite`）
+
+```
+原查询 → LLM 改写 3 个子查询 → 4 路并行召回（线程池）→ 内容 md5 合并去重
+      → LLM 重排取 Top3 → 结果缓存
+```
+每步都有兜底：改写失败用原始查询；重排失败保序截断；候选 ≤ top_k 跳过重排调用。
+实测："东西坏了想退钱" 改写出 4 路查询，7 条候选重排后精确命中 15 天质保/7 天无理由政策。
+
+### 数据层：10 万行业务库 + 双后端
+
+```bash
+python data/generate_big_data.py          # 生成 10 万条到 SQLite 业务库（shop.db-big）
+python data/generate_big_data.py --mysql  # 或直接建库建表灌入 MySQL（需 .env 配 MYSQL_PASSWORD）
+```
+
+- 规模：商品 800 / 顾客 2 万 / 订单 **10 万** / 明细约 16 万，含真实感的时间分布、状态分布、物流停滞率
+- `config.json → database.backend` 可切 `sqlite` / `mysql`（pymysql），查询层方言差异集中封装
+- **双库回退**：业务库查不到的订单/商品自动回退主库（演示数据），新旧单号都能查
+- 实测 10 万行订单精确查询约 100ms，命中缓存后 <1ms
+- 平台数据（账号/会话/工单/记忆）与业务数据分离：业务库可随时重灌，平台数据稳定
+
 ### 多专家路由（src/router.py）
 每轮消息先由轻量 LLM 分类器（失败时规则兜底）识别意图，路由到对应专家接管：
 

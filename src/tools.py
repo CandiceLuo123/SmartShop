@@ -12,9 +12,15 @@
 import json
 import re
 import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
+
+from src import database, monitor
+from src.breaker import CircuitBreaker
+from src.cache import CacheManager
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,6 +35,54 @@ NO_REASON_WINDOW = 7  # 无理由退货（天）
 
 
 # ---------------------------------------------------------------- 基础设施
+# 可缓存工具（读多写少的查询类）；工单/售后校验不缓存
+CACHEABLE = {"query_order", "query_product", "search_knowledge",
+             "recommend_products"}
+
+_CACHE: CacheManager | None = None
+_BREAKERS: dict[str, CircuitBreaker] = {}
+_TOOL_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool")
+_RAG_LLM = None  # AgentSession 初始化时注入，供查询改写/重排使用
+
+
+def init_runtime(cfg: dict) -> None:
+    """初始化缓存与熔断器（幂等，进程级只做一次）。"""
+    global _CACHE
+    if _CACHE is None:
+        _CACHE = CacheManager(cfg)
+    for spec in TOOLS:
+        _BREAKERS.setdefault(spec["name"], CircuitBreaker(
+            spec["name"],
+            cfg.get("breaker", {}).get("failure_threshold", 5),
+            cfg.get("breaker", {}).get("recovery_seconds", 60)))
+
+
+def set_rag_llm(llm) -> None:
+    """AgentSession 启动时注入 LLM，供 search_with_rewrite 的改写/重排调用。"""
+    global _RAG_LLM
+    _RAG_LLM = llm
+
+
+def _fallback_result(tool: str, reason: str) -> dict:
+    """降级结果：熔断/超时/异常时给模型的兜底说明，而不是抛错。"""
+    if tool == "search_knowledge":
+        return {"found": False,
+                "hint": f"知识库暂时不可用（{reason}），请基于已有信息谨慎回答，"
+                        "并建议顾客稍后再试或转人工核实政策细节。"}
+    return {"degraded": True, "reason": reason,
+            "hint": f"工具 {tool} 暂时不可用（{reason}）。请告知顾客系统繁忙，"
+                    "建议稍后重试或回复\"转人工\"。"}
+
+
+def _bquery(cfg: dict, sql_big: str, sql_main: str, params: tuple) -> list[dict]:
+    """业务查询双库回退：先查业务库（10 万行）；SQLite 后端查不到时回退主库（演示数据）。"""
+    with database.business_conn(cfg) as conn:
+        rows = database.q(conn, sql_big, params)
+    if rows or database.backend_name(cfg) != "sqlite":
+        return rows
+    with closing(sqlite3.connect(ROOT / cfg["paths"]["db"])) as main:
+        main.row_factory = sqlite3.Row
+        return _rows(main, sql_main, params)
 def _connect(cfg: dict) -> sqlite3.Connection:
     conn = sqlite3.connect(ROOT / cfg["paths"]["db"])
     conn.row_factory = sqlite3.Row
@@ -94,63 +148,91 @@ def get_customer_profile(customer_id: str, cfg: dict) -> str:
 
 # ---------------------------------------------------------------- 工具实现
 def query_order(cfg: dict, order_no: str = None, customer_id: str = None) -> dict:
-    """查订单：支持订单号精确/后缀匹配，或按顾客列出名下订单。"""
-    with closing(_connect(cfg)) as conn:
-        if order_no:
-            order_no = re.sub(r"\s+", "", str(order_no)).upper()
-            rows = _rows(conn, "SELECT * FROM orders WHERE order_no=?", (order_no,))
-            if not rows:
-                rows = _rows(conn, "SELECT * FROM orders WHERE order_no LIKE ?",
-                             (f"%{order_no}",))
-            if not rows:
-                return {"found": False,
-                        "hint": "未找到该订单号，请与顾客核对（形如 SO2610120001）。"}
-            out = []
-            for o in rows:
-                o["items"] = _rows(
-                    conn,
-                    "SELECT i.sku, i.qty, i.unit_price, i.item_status, p.name, "
-                    "       p.category, p.tags "
-                    "FROM order_items i LEFT JOIN products p ON i.sku=p.sku "
-                    "WHERE i.order_no=?", (o["order_no"],))
-                for it in o["items"]:
-                    it["tags"] = _parse_tags(it.get("tags"))
+    """查订单（业务库+主库回退）：支持订单号精确/后缀匹配，或按顾客列出名下订单。"""
+    ph_ = database.ph(cfg)
+    if order_no:
+        order_no = re.sub(r"\s+", "", str(order_no)).upper()
+        ot, it, pt = (database.btable(cfg, n)
+                      for n in ("orders", "order_items", "products"))
+        # 单号子句对两种后端通用（LIKE 通配符放在参数值里）
+        sql_big = (f"SELECT * FROM {ot} WHERE order_no = {ph_} "
+                   f"OR order_no LIKE {ph_} LIMIT 2")
+        rows = _bquery(cfg, sql_big,
+                       "SELECT * FROM orders WHERE order_no=? OR order_no LIKE ? LIMIT 2",
+                       (order_no, f"%{order_no}"))
+        if not rows:
+            return {"found": False,
+                    "hint": "未找到该订单号，请与顾客核对（格式如 SO2610120001）。"}
+        out = []
+        for o in rows:
+            o["items"] = _bquery(
+                cfg,
+                f"SELECT i.sku, i.qty, i.unit_price, i.item_status, p.name, "
+                f"p.category, p.tags FROM {it} i LEFT JOIN {pt} p ON i.sku=p.sku "
+                f"WHERE i.order_no={ph_}",
+                "SELECT i.sku, i.qty, i.unit_price, i.item_status, p.name, "
+                "p.category, p.tags FROM order_items i LEFT JOIN products p "
+                "ON i.sku=p.sku WHERE i.order_no=?",
+                (o["order_no"],))
+            for it_ in o["items"]:
+                it_["tags"] = _parse_tags(it_.get("tags"))
+            out.append(o)
+        # 工单在平台主库（SQLite），跨库补充展示
+        with closing(sqlite3.connect(ROOT / cfg["paths"]["db"])) as main:
+            main.row_factory = sqlite3.Row
+            for o in out:
                 o["tickets"] = _rows(
-                    conn, "SELECT ticket_id, type, priority, status, created_at "
+                    main, "SELECT ticket_id, type, priority, status, created_at "
                           "FROM tickets WHERE order_no=?", (o["order_no"],))
-                out.append(o)
-            return {"found": True, "orders": out}
-        if customer_id:
-            rows = _rows(
-                conn,
-                "SELECT order_no, status, total_amount, payment_time, "
-                "       logistics_status, receipt_time, created_at "
-                "FROM orders WHERE customer_id=? ORDER BY created_at DESC LIMIT 10",
-                (customer_id,))
-            return {"found": bool(rows), "orders": rows,
-                    "hint": None if rows else "该顾客名下暂无订单"}
-        return {"found": False, "error": "请提供 order_no 或 customer_id 之一。"}
+        return {"found": True, "orders": out}
+    if customer_id:
+        ot = database.btable(cfg, "orders")
+        rows = _bquery(
+            cfg,
+            f"SELECT order_no, status, total_amount, payment_time, logistics_status, "
+            f"receipt_time, created_at FROM {ot} WHERE customer_id={ph_} "
+            f"ORDER BY created_at DESC LIMIT 10",
+            "SELECT order_no, status, total_amount, payment_time, logistics_status, "
+            "receipt_time, created_at FROM orders WHERE customer_id=? "
+            "ORDER BY created_at DESC LIMIT 10", (customer_id,))
+        return {"found": bool(rows), "orders": rows,
+                "hint": None if rows else "该顾客名下暂无订单"}
+    return {"found": False, "error": "请提供 order_no 或 customer_id 之一。"}
 
 
 def query_product(cfg: dict, sku: str = None, keyword: str = None,
                   category: str = None) -> dict:
-    """查商品：sku 精确；keyword 模糊匹配名称/标签/描述；category 过滤类目。"""
-    with closing(_connect(cfg)) as conn:
-        if sku:
-            rows = _rows(conn, "SELECT * FROM products WHERE sku=?",
-                         (str(sku).upper(),))
-        else:
-            sql, params = "SELECT * FROM products WHERE 1=1", []
-            if category:
-                sql += " AND category LIKE ?"
-                params.append(f"%{category}%")
-            if keyword:
-                sql += (" AND (name LIKE ? OR sku LIKE ? OR tags LIKE ? "
-                        "OR description LIKE ? OR category LIKE ?)")
-                k = f"%{keyword}%"
-                params += [k, k, k, k, k]
-            sql += " ORDER BY rating DESC LIMIT 5"
-            rows = _rows(conn, sql, params)
+    """查商品（业务库+主库回退）：sku 精确；keyword 模糊匹配名称/标签/描述。"""
+    ph_ = database.ph(cfg)
+    pt = database.btable(cfg, "products")
+    def _search_cond(ph_: str) -> tuple[str, list]:
+        """keyword 多列 OR + category AND，占位符与参数严格一一对应。"""
+        conds, params = [], []
+        if keyword:
+            cols = ["name", "sku", "tags", "description", "category"]
+            conds.append("(" + " OR ".join(f"{c} LIKE {ph_}" for c in cols) + ")")
+            params += [f"%{keyword}%"] * len(cols)
+        if category:
+            conds.append(f"category LIKE {ph_}")
+            params.append(f"%{category}%")
+        return " AND ".join(conds), params
+
+    if sku:
+        rows = _bquery(cfg, f"SELECT * FROM {pt} WHERE sku={ph_}",
+                       "SELECT * FROM products WHERE sku=?", (str(sku).upper(),))
+    else:
+        cond_big, params_big = _search_cond(ph_)
+        cond_main, params_main = _search_cond("?")
+        with database.business_conn(cfg) as conn:
+            rows = database.q(
+                conn, f"SELECT * FROM {pt} WHERE {cond_big} "
+                      f"ORDER BY rating DESC LIMIT 5", tuple(params_big))
+        if not rows and database.backend_name(cfg) == "sqlite":
+            with closing(sqlite3.connect(ROOT / cfg["paths"]["db"])) as main:
+                main.row_factory = sqlite3.Row
+                rows = _rows(
+                    main, f"SELECT * FROM products WHERE {cond_main} "
+                          f"ORDER BY rating DESC LIMIT 5", tuple(params_main))
     for p in rows:
         p["tags"] = _parse_tags(p.get("tags"))
     if not rows:
@@ -159,8 +241,8 @@ def query_product(cfg: dict, sku: str = None, keyword: str = None,
     return {"found": True, "products": rows}
 
 
-def search_knowledge(cfg: dict, query: str) -> dict:
-    """知识库检索：按 '## ' 标题分块，词频打分（标题权重×3），返回 top3。"""
+def _recall(cfg: dict, query: str, top_k: int = 5) -> list[dict]:
+    """词频召回（单路）：按 '## ' 标题分块，标题权重×3。"""
     kdir = ROOT / cfg["paths"]["knowledge_dir"]
     chunks = []
     for md in sorted(kdir.glob("*.md")):
@@ -186,17 +268,104 @@ def search_knowledge(cfg: dict, query: str) -> dict:
             scored.append({"score": score, "source": f"{fname} · {heading}",
                            "content": body[:600]})
     scored.sort(key=lambda x: -x["score"])
-    if not scored:
-        return {"found": False,
-                "hint": "知识库未命中，请换个说法检索；仍无则如实告知并登记人工。"}
-    return {"found": True, "results": scored[:3]}
+    return scored[:top_k]
+
+
+def _rewrite_query(llm, query: str, n: int) -> list[str]:
+    """查询改写：扩写成 n 个不同角度的子查询；失败兜底返回原始查询。"""
+    try:
+        resp = llm.complete([
+            {"role": "system", "content":
+                "你是检索查询改写助手。把用户查询改写成不同角度的子查询，"
+                "每行一个，不要编号不要解释。"},
+            {"role": "user", "content": f"原始查询：{query}\n改写为 {n} 个子查询："},
+        ], tools=None, max_tokens=2048)
+        subs = [s.strip().lstrip("0123456789.、- ") for s in
+                (resp.get("content") or "").strip().splitlines() if s.strip()]
+        out = [query] + [s for s in subs if s and s != query]
+        return list(dict.fromkeys(out))[:n + 1]
+    except Exception:  # noqa: BLE001 —— 改写失败用原始查询
+        return [query]
+
+
+def _rerank(llm, query: str, items: list[dict], top_k: int) -> list[dict]:
+    """LLM 重排：候选多于 top_k 才调用；失败兜底保序截断。"""
+    if len(items) <= top_k or llm is None:
+        return items[:top_k]
+    try:
+        listing = "\n".join(f"{i}. [{x['source']}] {x['content'][:120]}"
+                            for i, x in enumerate(items))
+        resp = llm.complete([
+            {"role": "system", "content":
+                "你是检索结果重排助手，只输出 JSON 数组（按相关性降序的索引列表）。"},
+            {"role": "user", "content":
+                f"用户查询：{query}\n候选结果：\n{listing}\n"
+                f"返回最相关的前 {top_k} 个索引，格式如 [2,0,5]："},
+        ], tools=None, max_tokens=2048)
+        order = json.loads((resp.get("content") or "[]").strip()
+                           .removeprefix("```json").removeprefix("```")
+                           .removesuffix("```").strip())
+        picked = [items[i] for i in order
+                  if isinstance(i, int) and 0 <= i < len(items)]
+        return (picked + [x for x in items if x not in picked])[:top_k]
+    except Exception:  # noqa: BLE001 —— 重排失败按原始顺序截断
+        return items[:top_k]
+
+
+def search_with_rewrite(cfg: dict, query: str, top_k: int = 3) -> dict:
+    """
+    检索优化链路（借鉴 EchoMind search_with_rewrite）：
+      1. LLM 查询改写 → 原始 + 3 个子查询
+      2. 多路并行召回（线程池）
+      3. 按内容 md5 合并去重
+      4. LLM 重排取 Top-K（候选不足直接跳过，省一次调用）
+    任一环节失败都有兜底，不会让检索整体挂掉。
+    """
+    rag_cfg = cfg.get("rag", {})
+    n_sub = rag_cfg.get("rewrite_subqueries", 3)
+    recall_k = rag_cfg.get("recall_top_k", 5)
+
+    queries = _rewrite_query(_RAG_LLM, query, n_sub) if _RAG_LLM else [query]
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        futs = [pool.submit(_recall, cfg, q, recall_k) for q in queries]
+        all_results = [f.result() for f in futs]
+
+    seen, merged = set(), []
+    for results in all_results:
+        for item in results:
+            key = _CACHE.cache_key(item["source"], item["content"][:200]) \
+                if _CACHE else str(item)
+            if key not in seen:
+                seen.add(key)
+                merged.append(item)
+    merged.sort(key=lambda x: -x["score"])
+
+    reranked = _rerank(_RAG_LLM, query, merged, top_k)
+    return {"found": bool(reranked),
+            "results": reranked,
+            "rewritten_queries": queries,
+            "merged_candidates": len(merged),
+            "reranked": _RAG_LLM is not None and len(merged) > top_k,
+            "hint": None if reranked else
+                    "知识库未命中，请换个说法检索；仍无则如实告知并登记人工。"}
+
+
+def search_knowledge(cfg: dict, query: str) -> dict:
+    """知识库检索：走改写+并行召回+重排的完整链路（结果由 execute_tool 缓存）。"""
+    return search_with_rewrite(cfg, query, cfg.get("rag", {}).get("rerank_top_k", 3))
 
 
 def recommend_products(cfg: dict, use_case: str = None, budget: float = None,
                        category: str = None) -> dict:
-    """商品推荐：预算/类目过滤 + 场景标签匹配，按(匹配度, 评分)排序取 top3。"""
-    with _connect(cfg) as conn:
-        rows = _rows(conn, "SELECT * FROM products WHERE status='在售'")
+    """商品推荐（业务库，主库演示数据合并）：预算/类目过滤 + 场景标签匹配。"""
+    ph_ = database.ph(cfg)
+    pt = database.btable(cfg, "products")
+    with database.business_conn(cfg) as conn:
+        rows = database.q(conn, f"SELECT * FROM {pt} WHERE status={ph_}", ("在售",))
+    if database.backend_name(cfg) == "sqlite":  # 合并主库演示商品
+        with closing(sqlite3.connect(ROOT / cfg["paths"]["db"])) as main:
+            main.row_factory = sqlite3.Row
+            rows += _rows(main, "SELECT * FROM products WHERE status='在售'")
     wants = _tokens(use_case or "")
     filtered = []
     for p in rows:
@@ -274,17 +443,21 @@ def apply_after_sales(cfg: dict, order_no: str, issue_type: str = "质量问题"
     if request not in REQUEST_TYPES:
         return {"error": f"request 必须是 {'/'.join(sorted(REQUEST_TYPES))} 之一"}
 
-    with closing(_connect(cfg)) as conn:
-        rows = _rows(conn, "SELECT * FROM orders WHERE order_no=?",
-                     (re.sub(r"\s+", "", str(order_no)).upper(),))
-        if not rows:
-            return {"error": f"未找到订单 {order_no}，请先与顾客核对订单号。"}
-        order = rows[0]
-        items = _rows(
-            conn,
-            "SELECT i.sku, i.qty, i.item_status, p.name, p.tags "
-            "FROM order_items i LEFT JOIN products p ON i.sku=p.sku "
-            "WHERE i.order_no=?", (order["order_no"],))
+    ot, it, pt = (database.btable(cfg, n)
+                  for n in ("orders", "order_items", "products"))
+    rows = _bquery(cfg, f"SELECT * FROM {ot} WHERE order_no = {database.ph(cfg)}",
+                   "SELECT * FROM orders WHERE order_no=?",
+                   (re.sub(r"\s+", "", str(order_no)).upper(),))
+    if not rows:
+        return {"error": f"未找到订单 {order_no}，请先与顾客核对订单号。"}
+    order = rows[0]
+    items = _bquery(
+        cfg,
+        f"SELECT i.sku, i.qty, i.item_status, p.name, p.tags "
+        f"FROM {it} i LEFT JOIN {pt} p ON i.sku=p.sku WHERE i.order_no={database.ph(cfg)}",
+        "SELECT i.sku, i.qty, i.item_status, p.name, p.tags "
+        "FROM order_items i LEFT JOIN products p ON i.sku=p.sku WHERE i.order_no=?",
+        (order["order_no"],))
     for it in items:
         it["tags"] = _parse_tags(it.get("tags"))
     receipt = _parse_dt(order.get("receipt_time"))
@@ -476,15 +649,75 @@ def tools_schema() -> list[dict]:
     return [{"type": "function", "function": spec} for spec in TOOLS]
 
 
+def _is_empty_result(result) -> bool:
+    """业务空结果判定：命中则走短 TTL 空值缓存（防穿透）。"""
+    if not isinstance(result, dict):
+        return False
+    if result.get("found") is False:
+        return True
+    if result.get("recommendations") == []:
+        return True
+    if result.get("results") == [] and "hint" in result:
+        return True
+    return False
+
+
 def execute_tool(name: str, arguments: dict, cfg: dict) -> tuple[dict, str | None]:
-    """执行工具：返回 (结果, 错误信息)。异常不抛出，保证 Agent 循环不中断。"""
+    """
+    工具调用统一管道（借鉴 EchoMind MCPToolManager.call）：
+      参数校验 → 熔断检查 → 缓存命中 → 线程池执行（超时控制）→ 写缓存 → 统计
+    熔断打开 / 超时 / 执行异常 三种情况走 fallback 降级结果，绝不抛出中断 Agent 循环。
+    """
+    init_runtime(cfg)
     fn = TOOL_IMPL.get(name)
     if fn is None:
         return {"error": f"未知工具: {name}"}, "unknown_tool"
+    breaker = _BREAKERS[name]
+
+    # 1) 参数校验：字符串参数合法性（防恶意查询穿透缓存与数据库）
+    for key, val in (arguments or {}).items():
+        if isinstance(val, str):
+            err = _CACHE.validate_query(val) if _CACHE else None
+            if err:
+                return {"error": f"参数 {key} 非法：{err}"}, "bad_arguments"
+
+    # 2) 熔断检查
+    if not breaker.allow():
+        return _fallback_result(name, "熔断保护中"), "breaker_open"
+
+    # 3) 缓存
+    cacheable = name in CACHEABLE and _CACHE
+    cache_key = _CACHE.cache_key(name, json.dumps(arguments, sort_keys=True,
+                                                 ensure_ascii=False)) if cacheable else ""
+    if cacheable:
+        hit, cached = _CACHE.get(cache_key)
+        if hit:
+            monitor.STATS.record_tool(name, True, 0)
+            return cached, None
+
+    # 4) 线程池执行 + 超时（per-tool 覆盖：RAG 链路含改写+重排两次 LLM 调用，需更长预算）
+    t0 = time.time()
+    args = {k: v for k, v in (arguments or {}).items() if v is not None}
+    default_timeout = cfg.get("breaker", {}).get("tool_timeout_seconds", 30)
+    timeout_s = {"search_knowledge": 75}.get(name, default_timeout)
     try:
-        args = {k: v for k, v in (arguments or {}).items() if v is not None}
-        return fn(cfg, **args), None
+        future = _TOOL_POOL.submit(fn, cfg, **args)
+        result = future.result(timeout=timeout_s)
+    except FuturesTimeout:
+        future.cancel()
+        breaker.record_failure()
+        monitor.STATS.record_tool(name, False, 99999)
+        return _fallback_result(name, "执行超时"), "timeout"
     except TypeError as e:
         return {"error": f"参数错误: {e}"}, "bad_arguments"
-    except Exception as e:  # noqa: BLE001 —— 工具层兜底，失败信息回传模型
-        return {"error": f"工具执行失败: {type(e).__name__}: {e}"}, "tool_error"
+    except Exception as e:  # noqa: BLE001 —— 工具层兜底
+        breaker.record_failure()
+        monitor.STATS.record_tool(name, False, int((time.time() - t0) * 1000))
+        return _fallback_result(name, f"执行异常: {type(e).__name__}"), "tool_error"
+
+    # 5) 成功 → 写缓存 + 熔断计数恢复 + 统计
+    breaker.record_success()
+    monitor.STATS.record_tool(name, True, int((time.time() - t0) * 1000))
+    if cacheable:
+        _CACHE.set(cache_key, result, is_null=_is_empty_result(result))
+    return result, None

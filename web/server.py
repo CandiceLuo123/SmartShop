@@ -16,10 +16,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.agent import AgentSession, load_config
+from src.agent import AgentSession, get_skill_manager, load_config
 from src.llm import build_llm
 from src import memory
-from src.tools import get_customer_profile
+from src.monitor import monitor_summary, start_monitor
+from src.tools import get_customer_profile, init_runtime as init_tools
 from web import auth
 from web.db import connect, ensure_schema, next_customer_id, now_str, rows
 
@@ -29,6 +30,8 @@ STATIC = Path(__file__).resolve().parent / "static"
 app = FastAPI(title="小铺智答", docs_url=None, redoc_url=None)
 
 _CFG = load_config()
+init_tools(_CFG)          # 缓存/熔断器初始化
+start_monitor(_CFG)       # 性能监控后台线程（采集+降权+告警）
 _LLM, _BACKEND = build_llm(_CFG, "auto")
 _AGENTS: dict[str, AgentSession] = {}          # session_id -> AgentSession
 _AGENTS_LOCK = threading.Lock()
@@ -456,3 +459,25 @@ def admin_chat_detail(sid: str, request: Request):
             except json.JSONDecodeError:
                 m[field] = []
     return {"session": meta[0], "messages": msgs}
+
+
+# ---------------------------------------------------------------- 系统监控与 Skills
+@app.get("/api/admin/monitor")
+def admin_monitor(request: Request):
+    require_admin(request)
+    return monitor_summary()
+
+
+@app.get("/api/admin/skills")
+def admin_skills(request: Request):
+    require_admin(request)
+    sm = get_skill_manager(_CFG)
+    return {"skills": sm.list_skills(), "errors": sm._errors}
+
+
+@app.post("/api/admin/skills/reload")
+def admin_skills_reload(request: Request):
+    require_admin(request)
+    sm = get_skill_manager(_CFG)
+    n = sm.reload()
+    return {"ok": True, "skills": n, "list": sm.list_skills()}
